@@ -65,6 +65,7 @@ const res = withState((s) => {
     const pane = rest[rest.indexOf("--pane") + 1];
     const kind = rest[rest.indexOf("--kind") + 1];
     if (find(pane)) return fail("pane_not_available");
+    if (s.agents.some((a) => a.name === name)) return fail("agent_name_taken");
     if (s.start === "fail") return fail("pane_not_available");
     const agent = { pane_id: pane, name, agent: kind, agent_status: s.start === "not_ready" ? "blocked" : "idle", focused: true, agent_session: null };
     s.agents.push(agent);
