@@ -22,6 +22,17 @@ it does not stop it. See herdrdev/herdr discussion #631.
 | Claude Code | `/exit` | `--resume <id>` | `herdr integration install claude` (session identity) |
 | Codex | `/quit` | `resume <id>` | `herdr integration install codex` (session identity) |
 
+Live-tested: OpenCode 2 (full sleep/wake cycle) and Codex 0.140 (full
+sleep/wake cycle against a real session). Claude Code is profile-complete
+but not yet live-tested (no CLI available on the author's machine at time
+of writing). Codex-specific notes from testing:
+
+- on resume, Codex may re-show first-run dialogs (update notice, hook
+  trust) before the session loads; that's stock Codex behavior on any
+  resume, not plugin-specific
+- `resume <id>` after `/quit` restores the same session id, as printed by
+  Codex's own exit hint
+
 Lifecycle caveat: Claude and Codex states come from Herdr's screen manifest
 detection (their integrations report only session identity), which can
 occasionally misread state. The plugin re-checks immediately before sleeping
