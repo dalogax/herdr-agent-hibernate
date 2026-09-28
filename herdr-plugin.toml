@@ -1,0 +1,42 @@
+id = "dalogax.opencode-hibernate"
+name = "OpenCode Hibernate"
+version = "0.1.0"
+min_herdr_version = "0.9.1"
+description = "Auto-sleep idle OpenCode panes via /exit and resume the same session on focus (Orca-style agent hibernation for Herdr)."
+platforms = ["macos", "linux"]
+
+# One-shot init: mark already-idle panes dirty so the loop reevaluates state.
+[[startup]]
+command = ["node", "bin/hibernate.js", "startup"]
+
+# Sleep on demand. Keybindable; context must include a pane hosting opencode.
+[[actions]]
+id = "sleep-pane"
+title = "Hibernate this OpenCode pane"
+contexts = ["pane"]
+command = ["node", "bin/hibernate.js", "sleep-pane"]
+
+[[actions]]
+id = "list"
+title = "List hibernated sessions"
+contexts = []
+command = ["node", "bin/hibernate.js", "list"]
+
+# Fallback: if the server started before this plugin was enabled, `startup`
+# never ran for it. This action runs the same guard the startup hook does.
+[[actions]]
+id = "ensure-watcher"
+title = "Ensure the idle watcher is running"
+contexts = []
+command = ["node", "bin/hibernate.js", "startup"]
+
+[[actions]]
+id = "resume"
+title = "Resume a hibernated session"
+contexts = []
+command = ["node", "bin/hibernate.js", "resume"]
+
+# Wake hibernated sessions attached to panes that get focused.
+[[events]]
+on = "pane.focused"
+command = ["node", "bin/hibernate.js", "on-focus"]

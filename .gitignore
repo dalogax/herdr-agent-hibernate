@@ -1,0 +1,5 @@
+*.pid
+registry.json
+watch.log
+events.log
+node_modules/
