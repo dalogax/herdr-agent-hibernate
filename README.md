@@ -4,60 +4,65 @@
 Claude Code, Codex), resume the same session on focus.
 
 Watches agent panes; when one has been `idle` past a window and is not
-focused, submits the agent's exit command so the TUI exits cleanly back to
-its shell (freeing the process and its RAM). The native session id is
-recorded in the plugin state registry. When the pane is focused again, the
-plugin relaunches the agent in that same pane with its native resume flags,
-so the conversation picks up where it left off.
+focused, it ends the agent process cleanly so the pane drops back to its
+shell (freeing the process and its RAM). Once the agent is verified gone, the
+native session id is recorded in the plugin state registry. When the pane is
+focused again, the plugin relaunches the agent in that same pane with its
+native resume flags, so the conversation picks up where it left off.
 
-This exists because Herdr (as of 0.9.1) has no "free the process, keep the
-pane" primitive — `pane release-agent` only clears an agent's registration,
-it does not stop it. See herdrdev/herdr discussion #631.
+This exists because Herdr has no "free the process, keep the pane"
+primitive — `pane release-agent` only clears an agent's registration, it
+does not stop it. See herdrdev/herdr discussion #631.
 
 ## Supported agents
 
-| Agent | Exit command | Resume flags | Requirements |
+| Agent | How it is stopped | Resume flags | Requirements |
 | --- | --- | --- | --- |
-| OpenCode | `/exit` | `-s <id>` | `herdr integration install opencode` (lifecycle authority) |
-| Claude Code | `/exit` | `--resume <id>` | `herdr integration install claude` (session identity) |
-| Codex | `/quit` | `resume <id>` | `herdr integration install codex` (session identity) |
+| OpenCode | `SIGTERM` to the agent process | `-s <id>` | `herdr integration install opencode` (lifecycle authority) |
+| Claude Code | `SIGTERM` to the agent process | `--resume <id>` | `herdr integration install claude` (session identity) |
+| Codex | `/quit` typed into the composer | `resume <id>` | `herdr integration install codex` (session identity) |
 
-Live-tested: OpenCode 2 (full sleep/wake cycle) and Codex 0.140 (full
-sleep/wake cycle against a real session). Claude Code is profile-complete
-but not yet live-tested (no CLI available on the author's machine at time
-of writing). Codex-specific notes from testing:
+Live-tested on Herdr 0.9.0, installed as a plugin (startup hook, idle
+watcher, focus hook, actions):
 
-- on resume, Codex may re-show first-run dialogs (update notice, hook
-  trust) before the session loads; that's stock Codex behavior on any
-  resume, not plugin-specific
-- `resume <id>` after `/quit` restores the same session id, as printed by
-  Codex's own exit hint
+- **OpenCode** and **Claude Code** (2.1): full watcher sleep → focus wake →
+  conversation recalled.
+- **Codex** 0.140: full sleep/wake cycle with `/quit` (by the original
+  author). On resume, Codex may re-show first-run dialogs (update notice,
+  hook trust) before the session loads; the plugin treats that as a
+  successful resume, since you are looking at the pane.
 
-Lifecycle caveat: Claude and Codex states come from Herdr's screen manifest
-detection (their integrations report only session identity), which can
-occasionally misread state. The plugin re-checks immediately before sleeping
-and never touches a working/blocked pane, so a misread degrades to a harmless
-no-op rather than a lost session.
+### Why a signal, not `/exit`
+
+Typing an exit command goes through the composer, so any unsent draft
+becomes `<draft>/exit` and is **submitted as a real prompt**. With
+auto-approve modes, that can run tools. OpenCode and Claude Code both
+handle `SIGTERM` gracefully: the session is already persisted, terminal
+modes are restored, and the draft is discarded (never executed). Codex
+leaves the terminal's keyboard protocol enabled on any signal, so it keeps
+the typed `/quit`. **Caveat:** if you leave unsent text in a Codex composer,
+it will be submitted when the pane is slept. Exclude Codex with
+`HIBERNATE_AGENTS=opencode,claude` if that matters to you.
 
 ## Safety model
 
-- sleeps only agents whose state is exactly `idle` or `done` — **never**
-  `working`, `blocked`, or `unknown`, and never a focused pane
-- rechecks the state immediately before sending the exit command
-- the idle clock resets whenever the pane's agent leaves `idle` (any output,
-  a new turn, a permission prompt)
-
-
-Requires the OpenCode integration so Herdr has lifecycle state and the
-native session id:
-
-```sh
-herdr integration install opencode
-```
+- sleeps only agents whose state is exactly `idle` or `done`, **never**
+  `working`, `blocked`, or `unknown`, and the watcher never sleeps a focused
+  pane
+- rechecks the state immediately before stopping the agent
+- the idle clock resets whenever the pane's agent changes state (any output,
+  a new turn, a permission prompt), including changes that happen and settle
+  between two polls
+- a sleeper is recorded only after the agent has actually left the pane; if
+  it does not exit within 15 s, nothing is recorded and the pane is left alone
+- Claude and Codex states come from Herdr's screen detection, which can
+  occasionally misread. The pre-sleep recheck means a misread degrades to a
+  no-op.
 
 ## Install
 
 ```sh
+herdr integration install opencode   # and/or claude, codex
 herdr plugin install dalogax/herdr-opencode-hibernate
 ```
 
@@ -72,14 +77,13 @@ For local development, link a checkout instead:
 
 ```sh
 herdr plugin link /path/to/herdr-opencode-hibernate
-herdr plugin list
 herdr plugin action list --plugin dalogax.opencode-hibernate
 ```
 
 **Cautious rollout:** `plugin install` and `plugin link` register the plugin
-*enabled*, and enabling it spawns the idle watcher, which will start
-sleeping your idle OpenCode panes after the window elapses. Verify scripted
-sleep/resume once, then keep it enabled. To turn it off entirely:
+*enabled*. The watcher starts with the next Herdr server start (or run the
+`ensure-watcher` action), and will start sleeping idle agent panes after the
+window elapses. To turn it off entirely:
 
 ```sh
 herdr plugin disable dalogax.opencode-hibernate
@@ -89,12 +93,14 @@ herdr plugin disable dalogax.opencode-hibernate
 
 | Action | Meaning |
 | --- | --- |
-| `dalogax.opencode-hibernate.sleep-pane` | Sleep the context pane now (keybindable) |
-| `dalogax.opencode-hibernate.resume` | Wake a specific sleeper |
-| `dalogax.opencode-hibernate.list` | JSON dump of the sleeper registry |
-| `dalogax.opencode-hibernate.ensure-watcher` | Start the watcher if the server predates plugin enablement |
+| `sleep-pane` | Sleep the focused pane now (keybindable; must be idle) |
+| `resume` | Wake the sleeper in the focused pane |
+| `resume-all` | Wake every sleeper |
+| `list` | JSON dump of the sleeper registry |
+| `ensure-watcher` | Start the watcher if the server predates plugin enablement; replaces a watcher running outdated plugin code |
 
-CLI-equivalents (outside Herdr, for testing):
+Invoke with `herdr plugin action invoke <action> --plugin dalogax.opencode-hibernate`.
+CLI equivalents (for testing):
 
 ```sh
 node bin/hibernate.js sleep-pane w1:p2
@@ -102,28 +108,57 @@ node bin/hibernate.js list
 node bin/hibernate.js resume w1:p2
 ```
 
-
 ## Tuning
 
-The idle window comes from the environment the watcher inherits. To change
-it, set it before the Herdr server starts (or when re-spawning the watcher
-with `ensure-watcher`):
+Read from the environment the watcher inherits, i.e. the Herdr server's
+environment (set before the server starts, then run `ensure-watcher`):
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `HIBERNATE_IDLE_MINUTES` | `30` | Idle time before an unfocused pane is slept |
+| `HIBERNATE_AGENTS` | `opencode,claude,codex` | Agent kinds the plugin may sleep |
+| `HIBERNATE_POLL_SECONDS` | `60` | Watcher poll interval |
+| `HIBERNATE_EXIT_TIMEOUT_SECONDS` | `15` | How long to wait for an agent to exit |
+| `HIBERNATE_DEBUG` | unset | Log raw focus-event payloads |
+
+## State and logs
+
+`$HERDR_PLUGIN_STATE_DIR` (usually
+`~/.local/state/herdr/plugins/dalogax.opencode-hibernate/`) holds
+`registry.json`, `watcher.pid` and `watch.log`. The log records state
+changes, sleeps and resumes, and rotates at 1 MB. Herdr's plugin state dir
+is shared by all Herdr sessions, but pane ids are per session, so named
+sessions (`herdr --session work`) get their own `sessions/<name>/`
+subdirectory, each with its own registry and watcher.
+
+The watcher prunes registry entries for panes that were closed, and follows
+panes that were moved (they get a new pane id but keep their terminal).
+
+## Development
 
 ```sh
-export HIBERNATE_IDLE_MINUTES=30   # default 30
+npm test
 ```
+
+The tests drive `bin/hibernate.js` against a fake `herdr` CLI
+(`test/fake-herdr.js`, selected via `HERDR_BIN_PATH`), so they need no
+running Herdr server.
+
 ## Known limitations
 
 - **Watcher is a best-effort daemon.** Plugin v1 startup hooks are one-shot,
-  not supervised; the watcher is spawned detached from `startup`. If you stop
-  the Herdr server, it dies with it and is re-spawned on next server start.
+  not supervised; the watcher is spawned detached from `startup`. Only one
+  runs per Herdr session; it exits on its own if the server is unreachable
+  for 10 polls, and the next server start spawns a fresh one.
 - **Resume takes the pane to a fresh TUI render.** The session (history,
   cwd, provider state) resumes, but on-screen scrollback is redrawn from the
   new TUI boot.
 - **Resume flags**: `opencode -s <id>`, `claude --resume <id>`,
-  `codex resume <id>` — the same argv Herdr's own native session restore
-  uses, verified against its agent_resume planner. If a CLI changes its
-  resume syntax, it's one line in `AGENT_PROFILES` in `bin/hibernate.js`.
+  `codex resume <id>`, the same argv Herdr's own native session restore
+  uses. If a CLI changes its syntax, it's one line in `AGENT_PROFILES` in
+  `bin/hibernate.js`.
+- **A session id is needed before sleeping.** An agent that has not been
+  sent a message yet has no session, so it is never slept.
 - **Upstream coordination**: if Herdr ships a native "stop process, keep
   pane" method (the missing primitive named in discussion #631), this plugin
-  should switch its sleep path to use it and delete the exit-command trick.
+  should switch its sleep path to use it.
