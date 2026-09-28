@@ -7,7 +7,7 @@ set -euo pipefail
 SESSION=hibdemo
 export HERDR_SOCKET_PATH="${HERDR_CONFIG_DIR:-$HOME/.config/herdr}/sessions/$SESSION/herdr.sock"
 unset HERDR_PANE_ID HERDR_TAB_ID HERDR_WORKSPACE_ID
-STATE="${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/dalogax.opencode-hibernate/sessions/$SESSION"
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/dalogax.agent-hibernate/sessions/$SESSION"
 PROJECT="${DEMO_PROJECT:-/tmp/my-app}"
 h() { herdr "$@" 2>/dev/null; }
 

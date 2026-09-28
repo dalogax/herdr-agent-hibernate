@@ -1,4 +1,4 @@
-# herdr-opencode-hibernate
+# herdr-agent-hibernate
 
 **Agent hibernation for [Herdr](https://herdr.dev)**: auto-sleep idle agent
 panes (OpenCode, Claude Code, Codex), resume the same session on focus.
@@ -74,21 +74,21 @@ it will be submitted when the pane is slept. Exclude Codex with
 
 ```sh
 herdr integration install opencode   # and/or claude, codex
-herdr plugin install dalogax/herdr-opencode-hibernate
+herdr plugin install dalogax/herdr-agent-hibernate
 ```
 
 Herdr clones the repo, previews the source and commands it will run, and
 registers the plugin. Pin a revision if you prefer:
 
 ```sh
-herdr plugin install dalogax/herdr-opencode-hibernate --ref <tag-or-commit>
+herdr plugin install dalogax/herdr-agent-hibernate --ref <tag-or-commit>
 ```
 
 For local development, link a checkout instead:
 
 ```sh
-herdr plugin link /path/to/herdr-opencode-hibernate
-herdr plugin action list --plugin dalogax.opencode-hibernate
+herdr plugin link /path/to/herdr-agent-hibernate
+herdr plugin action list --plugin dalogax.agent-hibernate
 ```
 
 **Cautious rollout:** `plugin install` and `plugin link` register the plugin
@@ -97,7 +97,7 @@ herdr plugin action list --plugin dalogax.opencode-hibernate
 window elapses. To turn it off entirely:
 
 ```sh
-herdr plugin disable dalogax.opencode-hibernate
+herdr plugin disable dalogax.agent-hibernate
 ```
 
 ## Actions
@@ -110,7 +110,7 @@ herdr plugin disable dalogax.opencode-hibernate
 | `list` | JSON dump of the sleeper registry |
 | `ensure-watcher` | Start the watcher if the server predates plugin enablement; replaces a watcher running outdated plugin code |
 
-Invoke with `herdr plugin action invoke <action> --plugin dalogax.opencode-hibernate`.
+Invoke with `herdr plugin action invoke <action> --plugin dalogax.agent-hibernate`.
 CLI equivalents (for testing):
 
 ```sh
@@ -135,7 +135,7 @@ environment (set before the server starts, then run `ensure-watcher`):
 ## State and logs
 
 `$HERDR_PLUGIN_STATE_DIR` (usually
-`~/.local/state/herdr/plugins/dalogax.opencode-hibernate/`) holds
+`~/.local/state/herdr/plugins/dalogax.agent-hibernate/`) holds
 `registry.json`, `watcher.pid` and `watch.log`. The log records state
 changes, sleeps and resumes, and rotates at 1 MB. Herdr's plugin state dir
 is shared by all Herdr sessions, but pane ids are per session, so named

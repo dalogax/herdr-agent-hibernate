@@ -1,5 +1,5 @@
 {
-  "name": "herdr-opencode-hibernate",
+  "name": "herdr-agent-hibernate",
   "private": true,
   "description": "Herdr plugin: auto-sleep idle agent panes and resume the same session on focus",
   "license": "MIT",

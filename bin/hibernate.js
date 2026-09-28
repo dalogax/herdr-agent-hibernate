@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * OpenCode Hibernate — a Herdr plugin (v1 manifest surface).
+ * Agent Hibernate — a Herdr plugin (v1 manifest surface).
  *
  * Emulates agent hibernation for supported agent panes (opencode, claude,
  * codex):
@@ -48,7 +48,7 @@ const HERDR = process.env.HERDR_BIN_PATH || "herdr";
 // (e.g. ~/.local/state/herdr/plugins/<id>) when running hooks/actions, but
 // shell-launched instances (manual runs) get no env injection. Resolve the
 // same layout from HOME so every entrypoint converges on one directory.
-const PLUGIN_ID = "dalogax.opencode-hibernate";
+const PLUGIN_ID = "dalogax.agent-hibernate";
 const FALLBACK_STATE_DIR = path.join(
   process.env.HOME || ".",
   ".local", "state", "herdr", "plugins", PLUGIN_ID,
