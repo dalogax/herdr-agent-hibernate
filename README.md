@@ -1,32 +1,41 @@
 # herdr-opencode-hibernate
 
-Orca-style **agent hibernation for Herdr**, scoped to OpenCode.
+**Agent hibernation for Herdr**: auto-sleep idle agent panes (OpenCode,
+Claude Code, Codex), resume the same session on focus.
 
-Watches OpenCode panes; when one has been `idle` past a window and is not
-focused, submits `/exit` so the TUI exits cleanly back to its shell (freeing
-the process and its RAM). The native session id is recorded in the plugin
-state registry. When the pane is focused again, the plugin relaunches
-OpenCode in that same pane with `--resume <session-id>`, so the conversation
-picks up where it left off.
+Watches agent panes; when one has been `idle` past a window and is not
+focused, submits the agent's exit command so the TUI exits cleanly back to
+its shell (freeing the process and its RAM). The native session id is
+recorded in the plugin state registry. When the pane is focused again, the
+plugin relaunches the agent in that same pane with its native resume flags,
+so the conversation picks up where it left off.
 
 This exists because Herdr (as of 0.9.1) has no "free the process, keep the
 pane" primitive — `pane release-agent` only clears an agent's registration,
-it does not stop it. See herdrdev/herdr discussion #631 and the Orca
-[Agent hibernation docs](https://www.onorca.dev/docs/agents/hibernation) for
-the reference behavior. If you also run Orca, note it ships the desktop-app
-equivalent of this plugin as an experimental built-in.
+it does not stop it. See herdrdev/herdr discussion #631.
 
-## Safety model (deliberately narrower than Orca)
+## Supported agents
 
-- sleeps only agents whose state is exactly `idle` or `done` (Herdr's
-  lifecycle authority from the OpenCode integration) — **never** `working`,
-  `blocked`, or `unknown`, and never a focused pane
-- rechecks the state immediately before sending `/exit`
+| Agent | Exit command | Resume flags | Requirements |
+| --- | --- | --- | --- |
+| OpenCode | `/exit` | `-s <id>` | `herdr integration install opencode` (lifecycle authority) |
+| Claude Code | `/exit` | `--resume <id>` | `herdr integration install claude` (session identity) |
+| Codex | `/quit` | `resume <id>` | `herdr integration install codex` (session identity) |
+
+Lifecycle caveat: Claude and Codex states come from Herdr's screen manifest
+detection (their integrations report only session identity), which can
+occasionally misread state. The plugin re-checks immediately before sleeping
+and never touches a working/blocked pane, so a misread degrades to a harmless
+no-op rather than a lost session.
+
+## Safety model
+
+- sleeps only agents whose state is exactly `idle` or `done` — **never**
+  `working`, `blocked`, or `unknown`, and never a focused pane
+- rechecks the state immediately before sending the exit command
 - the idle clock resets whenever the pane's agent leaves `idle` (any output,
   a new turn, a permission prompt)
-- no subagent/orchestration gating yet (Herdr has no orchestration concept,
-  so Orca's "unsettled dispatch" check doesn't map; strict `idle`-only is the
-  equivalent guard)
+
 
 Requires the OpenCode integration so Herdr has lifecycle state and the
 native session id:
@@ -92,7 +101,6 @@ with `ensure-watcher`):
 ```sh
 export HIBERNATE_IDLE_MINUTES=30   # default 30
 ```
-
 ## Known limitations
 
 - **Watcher is a best-effort daemon.** Plugin v1 startup hooks are one-shot,
@@ -100,11 +108,11 @@ export HIBERNATE_IDLE_MINUTES=30   # default 30
   the Herdr server, it dies with it and is re-spawned on next server start.
 - **Resume takes the pane to a fresh TUI render.** The session (history,
   cwd, provider state) resumes, but on-screen scrollback is redrawn from the
-  new TUI boot. Orca has the same trade-off.
-- **Resume flag**: uses `--session <id>`, which is Herdr's own documented
-  resume mechanism for OpenCode panes (`opencode --session <id>`). If your
-  OpenCode build prefers a different form, it's the one argv array in
-  `resumePane()`.
+  new TUI boot.
+- **Resume flags**: `opencode -s <id>`, `claude --resume <id>`,
+  `codex resume <id>` — the same argv Herdr's own native session restore
+  uses, verified against its agent_resume planner. If a CLI changes its
+  resume syntax, it's one line in `AGENT_PROFILES` in `bin/hibernate.js`.
 - **Upstream coordination**: if Herdr ships a native "stop process, keep
   pane" method (the missing primitive named in discussion #631), this plugin
-  should switch its sleep path to use it and delete the `/exit` trick.
+  should switch its sleep path to use it and delete the exit-command trick.

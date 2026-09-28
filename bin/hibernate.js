@@ -2,12 +2,27 @@
 /**
  * OpenCode Hibernate — a Herdr plugin (v1 manifest surface).
  *
- * Emulates Orca's agent hibernation for OpenCode panes:
- *   sleep  : when an OpenCode pane has been idle past the threshold (and is
- *            not focused), submit /exit so the TUI exits cleanly back to a
- *            shell. Record the pane + native session id in $HERDR_PLUGIN_STATE_DIR/registry.json.
- *   resume : when a sleeper's pane is focused again, restart opencode in that
- *            same pane with `--session <session-id>`.
+ * Emulates agent hibernation for supported agent panes (opencode, claude,
+ * codex):
+ *   sleep  : when an agent pane has been idle past the threshold (and is
+ *            not focused), submit its exit command so the TUI exits cleanly
+ *            back to a shell. Record the pane + native session id in
+ *            $HERDR_PLUGIN_STATE_DIR/registry.json.
+ *   resume : when a sleeper's pane is focused again, restart the agent in
+ *            that same pane with its native resume flags.
+ *
+ * Per-agent profile (from Herdr's own agent_resume planner):
+ *   opencode: exit "/exit"            resume: -s <id>
+ *   claude:   exit "/exit"            resume: --resume <id>
+ *   codex:    exit "/quit"            resume: resume <id>
+ *
+ * Lifecycle caveats: opencode reports authoritative lifecycle state via its
+ * integration plugin; claude and codex state comes from Herdr's screen
+ * manifest detection (their integrations only provide session identity).
+ * Screen-detected `idle` can occasionally be a misread, and the /exit or
+ * /quit prompt lands harmlessly at the composer if so — but state is
+ * re-checked immediately before sending, and a blocked or working pane is
+ * never slept.
  *
  * Herdr plugin v1 has no long-running daemon primitive, so the idle watcher
  * is a detached child spawned (once) by the `startup` hook. Event hooks and
@@ -73,11 +88,22 @@ function herdrJson(args) {
   return JSON.parse(herdr(args));
 }
 
-/** Full pane+agent metadata for every pane that currently hosts opencode. */
-function listOcPanels() {
+/** Per-agent profile. argvResume receives the session id and returns the
+ *  argv AFTER the binary (passed after `--` in `agent start`, which forwards
+ *  everything to the agent executable). exitCommand is typed into the TUI
+ *  composer to end the session cleanly. */
+const AGENT_PROFILES = {
+  opencode: { exitCommand: "/exit", argvResume: (id) => ["-s", id] },
+  claude: { exitCommand: "/exit", argvResume: (id) => ["--resume", id] },
+  codex: { exitCommand: "/quit", argvResume: (id) => ["resume", id] },
+};
+const HIBERNATABLE = Object.keys(AGENT_PROFILES);
+
+/** Full pane+agent metadata for every pane hosting a hibernatable agent. */
+function listHibernatableAgents() {
   const snap = herdrJson(["agent", "list"]); // CLI is JSON-only
   const agents = (snap?.result?.agents) || [];
-  return agents.filter((a) => (a.agent || a.kind || "").toLowerCase() === "opencode");
+  return agents.filter((a) => HIBERNATABLE.includes((a.agent || "").toLowerCase()));
 }
 
 function agentGet(target) {
@@ -89,9 +115,11 @@ function agentGet(target) {
 }
 
 function normalizeAgent(a) {
+  const kind = (a.agent || "").toLowerCase();
   return {
     pane_id: a.pane_id,
-    name: a.name || a.agent || "opencode",
+    kind,
+    name: a.name || a.agent || kind,
     state: a.agent_status,
     session: a.agent_session?.value || null,
     focused: !!a.focused,
@@ -119,17 +147,20 @@ function assertStillIdle(target) {
 
 function sleepPane(paneId) {
   const norm = assertStillIdle(paneId);
+  const profile = AGENT_PROFILES[norm.kind];
+  if (!profile) throw new Error(`${paneId}: agent kind "${norm.kind}" is not hibernatable`);
   if (!norm.session) {
-    throw new Error(`${paneId} has no native session reference — OpenCode integration not installed? (herdr integration install opencode)`);
+    throw new Error(`${paneId} has no native session reference — install the ${norm.kind} integration first (herdr integration install ${norm.kind})`);
   }
 
   // Politely exit the TUI: `agent prompt` writes text plus a delayed,
   // bracketed-paste-aware Enter and requires an idle/unblocked agent —
-  // exactly the safety profile we want for /exit.
-  herdr(["agent", "prompt", paneId, "/exit"]);
+  // exactly the safety profile we want for an exit command.
+  herdr(["agent", "prompt", paneId, profile.exitCommand]);
 
   const reg = readRegistry();
   reg[norm.pane_id] = {
+    kind: norm.kind,
     session_id: norm.session,
     agent_name: norm.name,
     slept_at: Date.now(),
@@ -159,6 +190,15 @@ function resumePane(paneId) {
   const entry = reg[paneId];
   if (!entry) return false;
 
+  // Backward compatibility: registries written before multi-agent support
+  // have no `kind`. Infer from the recorded agent name (older versions were
+  // OpenCode-only, so that stays the default).
+  if (!entry.kind || !AGENT_PROFILES[entry.kind]) {
+    const inferred = (entry.agent_name || "opencode").toLowerCase();
+    entry.kind = HIBERNATABLE.find((k) => inferred.includes(k)) || "opencode";
+  }
+
+
   // Another hook from the same click already started the wake — don't race it.
   if (wakeLockFresh(paneId)) return false;
 
@@ -169,19 +209,19 @@ function resumePane(paneId) {
 
   // Agent names must be unique among live agents: never reuse a fixed name,
   // or two sleepers waking together will collide and one stays asleep.
-  const name = "oc-" + String(paneId).replace(/[^a-z0-9]/gi, "").toLowerCase() + "-" + Date.now().toString(36);
+  const name = "hz-" + String(paneId).replace(/[^a-z0-9]/gi, "").toLowerCase() + "-" + Date.now().toString(36);
+  const resumeArgv = AGENT_PROFILES[entry.kind].argvResume(entry.session_id);
   try {
     // `agent start` requires an available shell pane — which is exactly what
-    // a cleanly-exited sleeper is. `-s <id>` matches OpenCode's own resume
-    // hint ("Continue  opencode -s ses_...").
+    // a cleanly-exited sleeper is.
     herdr([
       "agent", "start", name,
-      "--kind", "opencode",
+      "--kind", entry.kind,
       "--pane", paneId,
-      "--", "-s", entry.session_id,
+      "--", ...resumeArgv,
     ]);
   } catch (e) {
-    // If the pane now hosts an opencode agent with our session id, a racing
+    // If the pane now hosts an agent with our session id, a racing
     // hook already resumed it — that is success, not failure.
     let resumedByRace = false;
     try {
@@ -238,12 +278,12 @@ function watchLoop(argv) {
   const tick = () => {
     let panes;
     try {
-      panes = listOcPanels().map(normalizeAgent);
+      panes = listHibernatableAgents().map(normalizeAgent);
     } catch (e) {
       log(`tick-error: ${e.message}`);
       return; // transient CLI/socket error; retry next tick
     }
-    log(`tick: ${panes.map(p => `${p.pane_id}=${p.state}${p.focused ? "(focused)" : ""}`).join(" ") || "no-agents"}`);
+    log(`tick: ${panes.map(p => `${p.pane_id}[${p.kind}]=${p.state}${p.focused ? "(focused)" : ""}`).join(" ") || "no-agents"}`);
     const now = Date.now();
     for (const p of panes) {
       // `done` = idle-but-unviewed in Herdr's lifecycle authority: still safe
@@ -257,7 +297,7 @@ function watchLoop(argv) {
           try {
             sleepPane(p.pane_id);
             idleSince.delete(p.pane_id);
-            log(`slept ${p.pane_id} (session ${p.session})`);
+            log(`slept ${p.pane_id}[${p.kind}] (session ${p.session})`);
           } catch (e) {
             // e.g. pane got blocked between ticks; keep timer running.
             log(`sleep-refused ${p.pane_id}: ${e.message}`);
@@ -326,6 +366,7 @@ try {
       const reg = readRegistry();
       const rows = Object.entries(reg).map(([pane, e]) => ({
         pane,
+        kind: e.kind,
         session: e.session_id,
         slept_at: new Date(e.slept_at).toISOString(),
         last_error: e.last_resume_error,
