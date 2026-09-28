@@ -11,9 +11,10 @@ picks up where it left off.
 
 This exists because Herdr (as of 0.9.1) has no "free the process, keep the
 pane" primitive — `pane release-agent` only clears an agent's registration,
-it does not stop it. See herdrdev/herdr discussion #631 and Orca's
+it does not stop it. See herdrdev/herdr discussion #631 and the Orca
 [Agent hibernation docs](https://www.onorca.dev/docs/agents/hibernation) for
-the reference behavior.
+the reference behavior. If you also run Orca, note it ships the desktop-app
+equivalent of this plugin as an experimental built-in.
 
 ## Safety model (deliberately narrower than Orca)
 
