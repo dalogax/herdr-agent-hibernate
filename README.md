@@ -1,7 +1,11 @@
 # herdr-opencode-hibernate
 
-**Agent hibernation for Herdr**: auto-sleep idle agent panes (OpenCode,
-Claude Code, Codex), resume the same session on focus.
+**Agent hibernation for [Herdr](https://herdr.dev)**: auto-sleep idle agent
+panes (OpenCode, Claude Code, Codex), resume the same session on focus.
+
+![An idle OpenCode pane is hibernated after the idle window and resumes the same conversation when focused](demo/demo.gif)
+
+<sub>Demo sped up, with a 12-second idle window (default: 30 minutes).</sub>
 
 Watches agent panes; when one has been `idle` past a window and is not
 focused, it ends the agent process cleanly so the pane drops back to its
@@ -58,6 +62,13 @@ it will be submitted when the pane is slept. Exclude Codex with
 - Claude and Codex states come from Herdr's screen detection, which can
   occasionally misread. The pre-sleep recheck means a misread degrades to a
   no-op.
+
+## Requirements
+
+- Herdr ≥ 0.9.0 on Linux or macOS
+- Node.js ≥ 18 on `PATH` (no npm dependencies; the plugin uses only the
+  Node standard library)
+- The Herdr integration for each agent you want hibernated (below)
 
 ## Install
 
@@ -134,6 +145,20 @@ subdirectory, each with its own registry and watcher.
 The watcher prunes registry entries for panes that were closed, and follows
 panes that were moved (they get a new pane id but keep their terminal).
 
+## What it runs on your machine
+
+Herdr plugins run as your user without a sandbox, so here is the full list:
+
+- a detached watcher process (`node bin/hibernate.js watch-loop`) that polls
+  `herdr agent list` every minute
+- `SIGTERM` sent to an idle OpenCode or Claude Code process in a pane; for
+  Codex, `/quit` typed into its composer
+- `herdr agent start … -- <resume flags>` in the same pane when you focus it
+- `ps` to confirm the process named in `watcher.pid` is really the watcher
+
+It makes no network requests and reads nothing outside Herdr's CLI output
+and its own state directory.
+
 ## Development
 
 ```sh
@@ -142,7 +167,8 @@ npm test
 
 The tests drive `bin/hibernate.js` against a fake `herdr` CLI
 (`test/fake-herdr.js`, selected via `HERDR_BIN_PATH`), so they need no
-running Herdr server.
+running Herdr server. The demo GIF is reproducible; see
+[demo/README.md](demo/README.md).
 
 ## Known limitations
 
@@ -162,3 +188,8 @@ running Herdr server.
 - **Upstream coordination**: if Herdr ships a native "stop process, keep
   pane" method (the missing primitive named in discussion #631), this plugin
   should switch its sleep path to use it.
+
+## License
+
+[MIT](LICENSE). Not affiliated with or endorsed by the Herdr, OpenCode,
+Claude Code or Codex projects.

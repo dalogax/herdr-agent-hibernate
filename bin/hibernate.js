@@ -199,7 +199,7 @@ function normalizeAgent(a) {
     pane_id: a.pane_id,
     terminal_id: a.terminal_id || null,
     kind,
-    name: a.name || a.agent || kind,
+    name: a.name || null, // user-given agent name, if any
     state: a.agent_status,
     seq: a.state_change_seq ?? null,
     session: a.agent_session?.value || null,
@@ -342,13 +342,20 @@ function resumePane(paneId) {
       return true;
     }
 
-    // Agent names must be unique among live agents: never reuse a fixed
-    // name, or two sleepers waking together collide.
-    const name = "hz-" + paneId.replace(/[^a-z0-9]/gi, "").toLowerCase() + "-" + Date.now().toString(36);
+    const argv = AGENT_PROFILES[kind].argvResume(entry.session_id);
+    const start = (name) => herdr(["agent", "start", name, "--kind", kind, "--pane", paneId, "--", ...argv]);
+    // `agent start` requires an available shell pane — which is exactly what
+    // a cleanly-exited sleeper is. It also requires a name unique among live
+    // agents: keep the agent's own name when it had one, else a unique one.
+    const unique = `${kind}-${paneId.replace(/[^a-z0-9]/gi, "").toLowerCase()}-${Date.now().toString(36)}`;
+    const own = /^[a-z][a-z0-9_-]{0,31}$/.test(entry.agent_name || "") ? entry.agent_name : null;
     try {
-      // `agent start` requires an available shell pane — which is exactly
-      // what a cleanly-exited sleeper is.
-      herdr(["agent", "start", name, "--kind", kind, "--pane", paneId, "--", ...AGENT_PROFILES[kind].argvResume(entry.session_id)]);
+      try {
+        start(own || unique);
+      } catch (e) {
+        if (!own || e.code !== "agent_name_taken") throw e;
+        start(unique); // the old name is taken by another live agent now
+      }
     } catch (e) {
       // agent_not_ready = launched but waiting on a startup dialog (trust
       // prompt, update notice). The user is looking at it; that's a resume.
@@ -466,8 +473,12 @@ function watchLoop() {
       panes = listAgents();
       failures = 0;
     } catch (e) {
-      if (++failures >= MAX_POLL_FAILURES) {
-        log(`herdr unreachable for ${failures} polls; exiting (${e.message})`);
+      // The session's server was stopped; the next server start runs the
+      // startup hook and spawns a fresh watcher.
+      if (e.code === "server_not_running" || ++failures >= MAX_POLL_FAILURES) {
+        log(e.code === "server_not_running"
+          ? "herdr server stopped; exiting"
+          : `herdr unreachable for ${failures} polls; exiting (${e.message})`);
         process.exit(0);
       }
       log(`tick-error: ${e.message}`);

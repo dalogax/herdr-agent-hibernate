@@ -146,6 +146,28 @@ test("resume starts the agent with native resume argv and clears the entry", () 
   assert.deepEqual(t.registry(), {});
 });
 
+test("resume keeps the agent's own name, falling back when it is taken", () => {
+  const t = setup({ agents: [] });
+  t.writeRegistry({ "w1:p2": { kind: "claude", session_id: "a", agent_name: "reviewer", slept_at: 1 } });
+  t.run("resume", "w1:p2");
+  assert.equal(t.herdr().calls.find((c) => c[1] === "start")[2], "reviewer");
+
+  const u = setup({ agents: [agent({ pane_id: "w9:p9", name: "reviewer", agent_session: { value: "z" } })] });
+  u.writeRegistry({ "w1:p2": { kind: "claude", session_id: "a", agent_name: "reviewer", slept_at: 1 } });
+  assert.equal(u.run("resume", "w1:p2").status, 0);
+  const names = u.herdr().calls.filter((c) => c[1] === "start").map((c) => c[2]);
+  assert.equal(names[0], "reviewer");
+  assert.match(names[1], /^claude-w1p2-/);
+});
+
+test("sleep records the agent's own name only when it has one", () => {
+  const t = setup({ agents: [agent({ agent: "codex", name: "fixer" }), agent({ pane_id: "w1:p3", agent: "codex" })] });
+  t.run("sleep-pane", "w1:p2");
+  t.run("sleep-pane", "w1:p3");
+  assert.equal(t.registry()["w1:p2"].agent_name, "fixer");
+  assert.equal(t.registry()["w1:p3"].agent_name, null);
+});
+
 test("resume treats agent_not_ready (startup dialog) as success", () => {
   const t = setup({ agents: [], start: "not_ready" });
   t.writeRegistry({ "w1:p2": { kind: "codex", session_id: "c1", slept_at: 1 } });

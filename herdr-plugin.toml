@@ -1,6 +1,6 @@
 id = "dalogax.opencode-hibernate"
 name = "OpenCode Hibernate"
-version = "0.3.0"
+version = "0.3.1"
 min_herdr_version = "0.9.0"
 description = "Auto-sleep idle agent panes (OpenCode, Claude Code, Codex) and resume the same session on focus."
 platforms = ["macos", "linux"]
