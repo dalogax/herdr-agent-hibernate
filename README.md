@@ -34,7 +34,20 @@ native session id:
 herdr integration install opencode
 ```
 
-## Install (local dev)
+## Install
+
+```sh
+herdr plugin install dalogax/herdr-opencode-hibernate
+```
+
+Herdr clones the repo, previews the source and commands it will run, and
+registers the plugin. Pin a revision if you prefer:
+
+```sh
+herdr plugin install dalogax/herdr-opencode-hibernate --ref <tag-or-commit>
+```
+
+For local development, link a checkout instead:
 
 ```sh
 herdr plugin link /path/to/herdr-opencode-hibernate
@@ -42,13 +55,13 @@ herdr plugin list
 herdr plugin action list --plugin dalogax.opencode-hibernate
 ```
 
-**Cautious rollout:** the plugin links *enabled* by default, and enabling it
-spawns the idle watcher, which will start sleeping your idle OpenCode panes
-after the window elapses. Recommend verifying scripted sleep/resume once,
-then:
+**Cautious rollout:** `plugin install` and `plugin link` register the plugin
+*enabled*, and enabling it spawns the idle watcher, which will start
+sleeping your idle OpenCode panes after the window elapses. Verify scripted
+sleep/resume once, then keep it enabled. To turn it off entirely:
 
 ```sh
-herdr plugin enable dalogax.opencode-hibernate
+herdr plugin disable dalogax.opencode-hibernate
 ```
 
 ## Actions
@@ -68,10 +81,15 @@ node bin/hibernate.js list
 node bin/hibernate.js resume w1:p2
 ```
 
+
 ## Tuning
 
+The idle window comes from the environment the watcher inherits. To change
+it, set it before the Herdr server starts (or when re-spawning the watcher
+with `ensure-watcher`):
+
 ```sh
-export HIBERNATE_IDLE_MINUTES=30   # default 30, matches Orca's beta default
+export HIBERNATE_IDLE_MINUTES=30   # default 30
 ```
 
 ## Known limitations
