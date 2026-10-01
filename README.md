@@ -65,7 +65,10 @@ it will be submitted when the pane is slept. Exclude Codex with
 
 ## Requirements
 
-- Herdr ≥ 0.9.0 on Linux or macOS
+- Herdr ≥ 0.9.1 on Linux or macOS. Herdr 0.9.0 does not emit focus events
+  for manual navigation (switching tabs, workspaces or panes from the
+  keyboard or mouse), so agents sleep but never wake on focus there
+  (fixed upstream in 0.9.1, herdrdev/herdr#4077).
 - Node.js ≥ 18 on `PATH` (no npm dependencies; the plugin uses only the
   Node standard library)
 - The Herdr integration for each agent you want hibernated (below)
@@ -144,6 +147,9 @@ subdirectory, each with its own registry and watcher.
 
 The watcher prunes registry entries for panes that were closed, and follows
 panes that were moved (they get a new pane id but keep their terminal).
+Herdr reuses pane ids after a server restart, so an entry is matched by its
+terminal too: a pane whose id matches but whose terminal differs is someone
+else's pane, and its stale entry is dropped instead of resumed there.
 
 ## What it runs on your machine
 
