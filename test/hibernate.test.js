@@ -323,3 +323,38 @@ test("invalid HIBERNATE_IDLE_MINUTES falls back to the default", async () => {
     stopWatcher(t);
   }
 });
+
+test("resume refuses a pane id reused by another terminal and drops the entry", () => {
+  const t = setup({ agents: [], panes: [{ pane_id: "w1:p2", terminal_id: "term_new" }] });
+  t.writeRegistry({ "w1:p2": { kind: "claude", session_id: "old", terminal_id: "term_old", slept_at: 1 } });
+  const ev = JSON.stringify({ event: "pane_focused", data: { pane_id: "w1:p2", workspace_id: "w1" } });
+  const r = spawnSync(process.execPath, [BIN, "on-focus"], { env: { ...t.env, HERDR_PLUGIN_EVENT_JSON: ev }, encoding: "utf8" });
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(!t.herdr().calls.some((c) => c[1] === "start"));
+  assert.deepEqual(t.registry(), {});
+});
+
+test("resume proceeds when the pane is still the slept terminal", () => {
+  const t = setup({ agents: [], panes: [{ pane_id: "w1:p2", terminal_id: "term_a" }] });
+  t.writeRegistry({ "w1:p2": { kind: "claude", session_id: "s", terminal_id: "term_a", slept_at: 1 } });
+  assert.equal(t.run("resume", "w1:p2").status, 0);
+  assert.ok(t.herdr().calls.some((c) => c[1] === "start"));
+});
+
+test("watcher drops entries whose pane id now belongs to another terminal", async () => {
+  const t = setup(
+    { agents: [], panes: [{ pane_id: "w1:p2", terminal_id: "term_new" }, { pane_id: "w1:p3", terminal_id: "term_same" }] },
+    { HIBERNATE_POLL_SECONDS: "0.1" },
+  );
+  t.writeRegistry({
+    "w1:p2": { kind: "claude", session_id: "stale", terminal_id: "term_old", slept_at: 1 },
+    "w1:p3": { kind: "claude", session_id: "live", terminal_id: "term_same", slept_at: 1 },
+  });
+  t.run("startup");
+  try {
+    assert.ok(await waitFor(() => !t.registry()["w1:p2"]));
+    assert.deepEqual(Object.keys(t.registry()), ["w1:p3"]);
+  } finally {
+    stopWatcher(t);
+  }
+});

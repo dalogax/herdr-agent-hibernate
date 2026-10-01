@@ -319,7 +319,20 @@ function entryKind(entry) {
 }
 
 function resumePane(paneId) {
-  if (!readRegistry()[paneId]) return false; // cheap path for ordinary focus events
+  const seen = readRegistry()[paneId];
+  if (!seen) return false; // cheap path for ordinary focus events
+
+  // Never resume into a pane that only shares the id (server restarted
+  // since the sleep): that would start an old session in an unrelated pane.
+  // A pane missing from the list is left to the start attempt and pruning.
+  const pane = (herdrJson(["pane", "list"]).result?.panes || []).find((p) => p.pane_id === paneId);
+  if (pane && !sameTerminal(seen, pane)) {
+    updateRegistry((reg) => {
+      if (reg[paneId]?.session_id === seen.session_id) delete reg[paneId];
+    });
+    log(`registry: dropped ${paneId} (pane id reused by another terminal; session ${seen.session_id})`);
+    return false;
+  }
 
   const release = acquireWakeLock(paneId);
   if (!release) return false; // another hook from the same click is on it
@@ -378,25 +391,34 @@ function resumePane(paneId) {
 }
 
 // --- registry hygiene -------------------------------------------------------------
-/** Drop entries for closed panes; follow panes that moved (new pane id,
- *  same terminal). Pane ids are never reused, so a missing id is final. */
+/** True when the pane `paneId` in `panes` is still the terminal the entry
+ *  was slept in. Pane ids are reused after a server restart (w1:p1 again),
+ *  so a matching id alone can point at an unrelated shell. Entries written
+ *  before terminal ids were recorded are trusted. */
+function sameTerminal(entry, pane) {
+  return !!pane && (!entry.terminal_id || !pane.terminal_id || entry.terminal_id === pane.terminal_id);
+}
+
+/** Drop entries whose terminal is gone; follow panes that moved (new pane
+ *  id, same terminal). */
 function pruneRegistry() {
   if (Object.keys(readRegistry()).length === 0) return;
   const panes = herdrJson(["pane", "list"]).result?.panes;
   // A live server always has at least one pane; anything else is a bad
   // read, and dropping every sleeper on a bad read would be unrecoverable.
   if (!Array.isArray(panes) || panes.length === 0) return;
-  const ids = new Set(panes.map((p) => p.pane_id));
+  const byId = new Map(panes.map((p) => [p.pane_id, p]));
   const byTerminal = new Map(panes.map((p) => [p.terminal_id, p.pane_id]));
   updateRegistry((reg) => {
     for (const [paneId, entry] of Object.entries(reg)) {
-      if (ids.has(paneId)) continue;
+      if (sameTerminal(entry, byId.get(paneId))) continue;
       const moved = entry.terminal_id && byTerminal.get(entry.terminal_id);
       if (moved && !reg[moved]) {
         reg[moved] = entry;
         log(`registry: ${paneId} moved to ${moved}`);
       } else {
-        log(`registry: dropped ${paneId} (pane closed; session ${entry.session_id})`);
+        const why = byId.has(paneId) ? "pane id reused by another terminal" : "pane closed";
+        log(`registry: dropped ${paneId} (${why}; session ${entry.session_id})`);
       }
       delete reg[paneId];
     }
