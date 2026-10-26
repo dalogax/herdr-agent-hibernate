@@ -11,6 +11,9 @@
  *            verified gone.
  *   resume : when a sleeper's pane is focused again, restart the agent in
  *            that same pane with its native resume flags.
+ *   wait   : a slept pane is left at a "press any key" notice instead of a
+ *            bare shell, so it also wakes from clients that never report
+ *            focus to Herdr (web UIs). HIBERNATE_WAKE_ON_KEY=0 disables it.
  *
  * Per-agent profile (resume argv from Herdr's own agent_resume planner):
  *   opencode: exit SIGTERM            resume: -s <id>
@@ -80,6 +83,11 @@ function numberEnv(name, fallback) {
 const IDLE_WINDOW_MS = numberEnv("HIBERNATE_IDLE_MINUTES", 30) * 60_000;
 const POLL_MS = numberEnv("HIBERNATE_POLL_SECONDS", 60) * 1000;
 const EXIT_TIMEOUT_MS = numberEnv("HIBERNATE_EXIT_TIMEOUT_SECONDS", 15) * 1000;
+// A slept pane waits for a key to wake (see waitKey); 0/false/no/off disables.
+const WAKE_ON_KEY = !/^(0|false|no|off)$/i.test(process.env.HIBERNATE_WAKE_ON_KEY || "");
+// After the waiter exits, the shell needs a moment to redraw its prompt
+// before `agent start` accepts the pane.
+const PROMPT_GRACE_MS = 200;
 // Watcher gives up after this many consecutive failed polls (server gone).
 const MAX_POLL_FAILURES = 10;
 
@@ -112,12 +120,23 @@ function log(msg) {
 }
 
 // --- registry -------------------------------------------------------------------
+/** Missing registry = no sleepers. Anything else unreadable is an error:
+ *  treating a corrupt file as empty would let the next update overwrite it
+ *  and silently drop every sleeper. */
 function readRegistry() {
+  let raw;
   try {
-    return JSON.parse(fs.readFileSync(REGISTRY, "utf8"));
-  } catch {
-    return {};
+    raw = fs.readFileSync(REGISTRY, "utf8");
+  } catch (e) {
+    if (e.code === "ENOENT") return {};
+    throw e;
   }
+  let reg;
+  try { reg = JSON.parse(raw); } catch {}
+  if (!reg || typeof reg !== "object" || Array.isArray(reg)) {
+    throw new Error(`${REGISTRY} is not a valid registry; leaving it untouched (fix or delete it)`);
+  }
+  return reg;
 }
 function writeRegistry(reg) {
   fs.mkdirSync(STATE_DIR, { recursive: true });
@@ -242,12 +261,29 @@ function agentPid(paneId, kind) {
   return match.pid;
 }
 
-function waitForExit(paneId, session) {
+/** True once the agent has left the pane, false if it is still there at
+ *  the deadline. The exit has already been requested by now, so a herdr
+ *  error must not abort the wait (the agent would be gone and unrecorded):
+ *  transient errors are retried, a signalled pid that has vanished counts
+ *  as an exit on its own, and only an unverifiable exit throws. */
+function waitForExit(paneId, session, pid) {
   const deadline = Date.now() + EXIT_TIMEOUT_MS;
+  let lastErr = null;
   for (;;) {
-    const cur = agentInPane(paneId);
-    if (!cur || cur.session !== session) return true;
-    if (Date.now() > deadline) return false;
+    try {
+      const cur = agentInPane(paneId);
+      if (!cur || cur.session !== session) return true;
+      lastErr = null;
+    } catch (e) {
+      lastErr = e;
+      if (pid) {
+        try { process.kill(pid, 0); } catch { return true; }
+      }
+    }
+    if (Date.now() > deadline) {
+      if (lastErr) throw new Error(`${paneId}: cannot verify the agent exited (${lastErr.message})`);
+      return false;
+    }
     sleepMs(250);
   }
 }
@@ -257,8 +293,9 @@ function sleepPane(paneId, { manual = false } = {}) {
   const profile = AGENT_PROFILES[norm.kind];
 
   let how;
+  let pid = null;
   if (profile.exitSignal) {
-    const pid = agentPid(paneId, norm.kind);
+    pid = agentPid(paneId, norm.kind);
     process.kill(pid, profile.exitSignal);
     how = `${profile.exitSignal} to pid ${pid}`;
   } else {
@@ -269,22 +306,105 @@ function sleepPane(paneId, { manual = false } = {}) {
     how = `"${profile.exitCommand}"`;
   }
 
-  if (!waitForExit(paneId, norm.session)) {
+  if (!waitForExit(paneId, norm.session, pid)) {
     throw new Error(`${paneId}: ${norm.kind} still running ${EXIT_TIMEOUT_MS / 1000}s after ${how}; not recorded as hibernated`);
   }
 
-  updateRegistry((reg) => {
-    reg[paneId] = {
-      kind: norm.kind,
-      session_id: norm.session,
-      agent_name: norm.name,
-      terminal_id: norm.terminal_id,
-      slept_at: Date.now(),
-      idle_window_ms: IDLE_WINDOW_MS,
-    };
-  });
+  try {
+    updateRegistry((reg) => {
+      reg[paneId] = {
+        kind: norm.kind,
+        session_id: norm.session,
+        agent_name: norm.name,
+        terminal_id: norm.terminal_id,
+        slept_at: Date.now(),
+        idle_window_ms: IDLE_WINDOW_MS,
+      };
+    });
+  } catch (e) {
+    // The agent is gone; make sure the session id survives somewhere.
+    log(`slept ${paneId}[${norm.kind}] session=${norm.session} via ${how} but could not record it: ${e.message}`);
+    throw new Error(`${paneId}: ${norm.kind} exited (session ${norm.session}) but could not be recorded: ${e.message}`);
+  }
   log(`slept ${paneId}[${norm.kind}] session=${norm.session} via ${how}${manual ? " (manual)" : ""}`);
+  if (WAKE_ON_KEY) {
+    try {
+      startWaiter(paneId);
+    } catch (e) {
+      // Only the shortcut is lost: the sleeper is recorded, and the focus
+      // hook and the resume action still wake it.
+      log(`waiter not started in ${paneId}: ${e.message}`);
+    }
+  }
   return norm;
+}
+
+// --- key waiter (runs inside the slept pane) -----------------------------------------
+/** Type the waiter into the slept pane's shell. It inherits the pane's Herdr
+ *  env (socket, bin path); the state dir is passed along because the shell
+ *  has no HERDR_PLUGIN_STATE_DIR, and the session so a named session's
+ *  waiter finds that session's registry. */
+function startWaiter(paneId) {
+  const q = (v) => `'${String(v).replace(/'/g, "'\\''")}'`;
+  const env = [`HERDR_PLUGIN_STATE_DIR=${q(process.env.HERDR_PLUGIN_STATE_DIR || FALLBACK_STATE_DIR)}`];
+  if (SESSION !== "default") env.push(`HERDR_SESSION=${q(SESSION)}`);
+  for (const name of ["HERDR_BIN_PATH", "HIBERNATE_LOG"]) {
+    if (process.env[name]) env.push(`${name}=${q(process.env[name])}`);
+  }
+  herdr(["pane", "run", paneId, `${env.join(" ")} ${q(process.execPath)} ${q(__filename)} wait-key ${q(paneId)}`]);
+}
+
+/** Hold the slept pane at a notice until a key is pressed, then resume it.
+ *  No focus event is involved, so this wakes panes from clients that never
+ *  report focus to Herdr. Ctrl-C leaves the pane at its shell with the
+ *  sleeper kept for the focus hook and the resume action. */
+function waitKey(paneId) {
+  const entry = updateRegistry((reg) => {
+    if (!reg[paneId]) return null;
+    reg[paneId].waiter_pid = process.pid;
+    return reg[paneId];
+  });
+  if (!entry) return; // resumed or dropped before the waiter came up
+
+  const raw = !!process.stdin.isTTY;
+  if (raw) process.stdin.setRawMode(true);
+  process.stdout.write(`\x1b[2J\x1b[H\n  ${entryKind(entry)} hibernated \u00b7 session ${entry.session_id}\n\n  Press any key to resume. Ctrl-C leaves the shell; the resume action still works.\n`);
+  const leave = (msg) => {
+    if (raw) process.stdin.setRawMode(false);
+    process.stdout.write(`\n  ${msg}\n`);
+    process.exit(0);
+  };
+  const forget = () => {
+    try {
+      updateRegistry((reg) => { if (reg[paneId]?.waiter_pid === process.pid) delete reg[paneId].waiter_pid; });
+    } catch {}
+  };
+  process.on("SIGTERM", () => { forget(); leave("stopped"); });
+  process.on("SIGHUP", () => { forget(); process.exit(0); });
+  process.stdin.on("end", () => { forget(); leave("stopped"); });
+  process.stdin.once("data", (buf) => {
+    if (buf[0] === 0x03) { forget(); leave("left asleep"); }
+    // The entry may have moved with its pane since; resume whichever is ours.
+    let pane = paneId;
+    try {
+      pane = Object.entries(readRegistry()).find(([, e]) => e.waiter_pid === process.pid)?.[0] || paneId;
+    } catch {}
+    spawn(process.execPath, [__filename, "resume", pane], { detached: true, stdio: "ignore", env: process.env }).unref();
+    leave("resuming\u2026");
+  });
+}
+
+/** Stop the pane's waiter if one is still there and wait for the shell
+ *  prompt to come back, which `agent start` needs. The waiter that
+ *  triggered this resume is exiting on its own and gets the same wait. */
+function stopWaiter(entry) {
+  if (!entry.waiter_pid) return;
+  if (ownProcess(entry.waiter_pid, "wait-key")) {
+    try { process.kill(entry.waiter_pid, "SIGTERM"); } catch {}
+    const deadline = Date.now() + 3000;
+    while (ownProcess(entry.waiter_pid, "wait-key") && Date.now() < deadline) sleepMs(50);
+  }
+  sleepMs(PROMPT_GRACE_MS);
 }
 
 // --- resume ---------------------------------------------------------------------
@@ -347,16 +467,31 @@ function resumePane(paneId) {
     if (!entry) return false;
     const kind = entryKind(entry);
 
-    const running = () => {
-      try { return agentInPane(paneId)?.kind === kind; } catch { return false; }
+    // Any agent in the pane ends the sleeper: a racing hook may have
+    // resumed it, or the user started something else there. Keeping the
+    // entry would retry a doomed `agent start` on every focus.
+    const occupant = () => {
+      try { return agentInPane(paneId); } catch { return null; }
     };
-    if (running()) {
-      log(`resume ${paneId}: ${kind} already running there; dropping sleeper entry`);
+    const there = occupant();
+    if (there) {
+      log(`resume ${paneId}: ${there.kind} already running there; dropping sleeper entry`);
       return true;
     }
 
+    stopWaiter(entry);
     const argv = AGENT_PROFILES[kind].argvResume(entry.session_id);
-    const start = (name) => herdr(["agent", "start", name, "--kind", kind, "--pane", paneId, "--", ...argv]);
+    const start = (name) => {
+      for (let attempt = 1; ; attempt++) {
+        try {
+          return herdr(["agent", "start", name, "--kind", kind, "--pane", paneId, "--", ...argv]);
+        } catch (e) {
+          // The shell prompt can still be on its way back after the waiter's exit.
+          if (e.code !== "pane_not_available" || !entry.waiter_pid || attempt >= 3) throw e;
+          sleepMs(500);
+        }
+      }
+    };
     // `agent start` requires an available shell pane — which is exactly what
     // a cleanly-exited sleeper is. It also requires a name unique among live
     // agents: keep the agent's own name when it had one, else a unique one.
@@ -373,7 +508,7 @@ function resumePane(paneId) {
       // agent_not_ready = launched but waiting on a startup dialog (trust
       // prompt, update notice). The user is looking at it; that's a resume.
       // Otherwise, if the agent is in the pane anyway, a racing hook won.
-      if (e.code === "agent_not_ready" || running()) {
+      if (e.code === "agent_not_ready" || occupant()) {
         log(`resume ${paneId}: ${kind} started (${e.code || "raced"})`);
         return true;
       }
@@ -441,17 +576,17 @@ function readWatcherPid() {
   }
 }
 
-/** Alive AND actually our watcher (guards against pid reuse). */
-function isWatcherProcess(pid) {
+/** Alive AND actually ours, running `marker` (guards against pid reuse). */
+function ownProcess(pid, marker) {
   if (!pid) return false;
   try { process.kill(pid, 0); } catch { return false; }
   const r = spawnSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8" });
-  return r.status === 0 && r.stdout.includes("watch-loop");
+  return r.status === 0 && r.stdout.includes(marker);
 }
 
 function ensureWatcher() {
   const cur = readWatcherPid();
-  if (cur && isWatcherProcess(cur.pid)) {
+  if (cur && ownProcess(cur.pid, "watch-loop")) {
     if (cur.stamp === codeStamp()) return `watcher already running (pid ${cur.pid})`;
     try { process.kill(cur.pid, "SIGTERM"); } catch {}
     log(`replacing watcher pid=${cur.pid} (plugin code changed)`);
@@ -472,7 +607,7 @@ function watchLoop() {
   // Normally ensureWatcher already wrote our pid; claim it when run by hand.
   const claimed = readWatcherPid();
   if (!claimed || claimed.pid !== process.pid) {
-    if (claimed && isWatcherProcess(claimed.pid)) {
+    if (claimed && ownProcess(claimed.pid, "watch-loop")) {
       console.log(`watcher already running (pid ${claimed.pid})`);
       return;
     }
@@ -609,6 +744,12 @@ function main(cmd, args) {
       break;
     }
 
+    case "wait-key": {
+      if (!args[0]) throw new Error("pass a pane id: hibernate.js wait-key w1:p2");
+      waitKey(args[0]);
+      break;
+    }
+
     case "list": {
       const rows = Object.entries(readRegistry()).map(([pane, e]) => ({
         pane,
@@ -622,7 +763,7 @@ function main(cmd, args) {
     }
 
     default:
-      console.log("usage: hibernate.js <startup|watch-loop|sleep-pane|resume|resume-all|list|on-focus> [pane_id]");
+      console.log("usage: hibernate.js <startup|watch-loop|sleep-pane|resume|resume-all|list|on-focus|wait-key> [pane_id]");
       process.exitCode = 2;
   }
 }
