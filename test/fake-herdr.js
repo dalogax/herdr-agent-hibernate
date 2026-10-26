@@ -9,6 +9,7 @@
 //   panes:  [{ pane_id, terminal_id }],
 //   start:  "ok" | "not_ready" | "fail",           // agent start behaviour
 //   exitOnPrompt: true,                             // typed exit command works
+//   failGetsFrom: N,                                // `agent get` call N onward fails (server down)
 // }
 const fs = require("node:fs");
 
@@ -48,6 +49,8 @@ const res = withState((s) => {
 
   if (group === "agent" && cmd === "list") return ok({ agents: s.agents });
   if (group === "agent" && cmd === "get") {
+    const gets = s.calls.filter((c) => c[0] === "agent" && c[1] === "get").length;
+    if (s.failGetsFrom && gets >= s.failGetsFrom) return fail("server_not_running");
     const a = find(rest[0]);
     return a ? ok({ agent: a }) : fail("agent_not_found");
   }

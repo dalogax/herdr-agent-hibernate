@@ -112,12 +112,23 @@ function log(msg) {
 }
 
 // --- registry -------------------------------------------------------------------
+/** Missing registry = no sleepers. Anything else unreadable is an error:
+ *  treating a corrupt file as empty would let the next update overwrite it
+ *  and silently drop every sleeper. */
 function readRegistry() {
+  let raw;
   try {
-    return JSON.parse(fs.readFileSync(REGISTRY, "utf8"));
-  } catch {
-    return {};
+    raw = fs.readFileSync(REGISTRY, "utf8");
+  } catch (e) {
+    if (e.code === "ENOENT") return {};
+    throw e;
   }
+  let reg;
+  try { reg = JSON.parse(raw); } catch {}
+  if (!reg || typeof reg !== "object" || Array.isArray(reg)) {
+    throw new Error(`${REGISTRY} is not a valid registry; leaving it untouched (fix or delete it)`);
+  }
+  return reg;
 }
 function writeRegistry(reg) {
   fs.mkdirSync(STATE_DIR, { recursive: true });
@@ -242,12 +253,29 @@ function agentPid(paneId, kind) {
   return match.pid;
 }
 
-function waitForExit(paneId, session) {
+/** True once the agent has left the pane, false if it is still there at
+ *  the deadline. The exit has already been requested by now, so a herdr
+ *  error must not abort the wait (the agent would be gone and unrecorded):
+ *  transient errors are retried, a signalled pid that has vanished counts
+ *  as an exit on its own, and only an unverifiable exit throws. */
+function waitForExit(paneId, session, pid) {
   const deadline = Date.now() + EXIT_TIMEOUT_MS;
+  let lastErr = null;
   for (;;) {
-    const cur = agentInPane(paneId);
-    if (!cur || cur.session !== session) return true;
-    if (Date.now() > deadline) return false;
+    try {
+      const cur = agentInPane(paneId);
+      if (!cur || cur.session !== session) return true;
+      lastErr = null;
+    } catch (e) {
+      lastErr = e;
+      if (pid) {
+        try { process.kill(pid, 0); } catch { return true; }
+      }
+    }
+    if (Date.now() > deadline) {
+      if (lastErr) throw new Error(`${paneId}: cannot verify the agent exited (${lastErr.message})`);
+      return false;
+    }
     sleepMs(250);
   }
 }
@@ -257,8 +285,9 @@ function sleepPane(paneId, { manual = false } = {}) {
   const profile = AGENT_PROFILES[norm.kind];
 
   let how;
+  let pid = null;
   if (profile.exitSignal) {
-    const pid = agentPid(paneId, norm.kind);
+    pid = agentPid(paneId, norm.kind);
     process.kill(pid, profile.exitSignal);
     how = `${profile.exitSignal} to pid ${pid}`;
   } else {
@@ -269,20 +298,26 @@ function sleepPane(paneId, { manual = false } = {}) {
     how = `"${profile.exitCommand}"`;
   }
 
-  if (!waitForExit(paneId, norm.session)) {
+  if (!waitForExit(paneId, norm.session, pid)) {
     throw new Error(`${paneId}: ${norm.kind} still running ${EXIT_TIMEOUT_MS / 1000}s after ${how}; not recorded as hibernated`);
   }
 
-  updateRegistry((reg) => {
-    reg[paneId] = {
-      kind: norm.kind,
-      session_id: norm.session,
-      agent_name: norm.name,
-      terminal_id: norm.terminal_id,
-      slept_at: Date.now(),
-      idle_window_ms: IDLE_WINDOW_MS,
-    };
-  });
+  try {
+    updateRegistry((reg) => {
+      reg[paneId] = {
+        kind: norm.kind,
+        session_id: norm.session,
+        agent_name: norm.name,
+        terminal_id: norm.terminal_id,
+        slept_at: Date.now(),
+        idle_window_ms: IDLE_WINDOW_MS,
+      };
+    });
+  } catch (e) {
+    // The agent is gone; make sure the session id survives somewhere.
+    log(`slept ${paneId}[${norm.kind}] session=${norm.session} via ${how} but could not record it: ${e.message}`);
+    throw new Error(`${paneId}: ${norm.kind} exited (session ${norm.session}) but could not be recorded: ${e.message}`);
+  }
   log(`slept ${paneId}[${norm.kind}] session=${norm.session} via ${how}${manual ? " (manual)" : ""}`);
   return norm;
 }
@@ -347,11 +382,15 @@ function resumePane(paneId) {
     if (!entry) return false;
     const kind = entryKind(entry);
 
-    const running = () => {
-      try { return agentInPane(paneId)?.kind === kind; } catch { return false; }
+    // Any agent in the pane ends the sleeper: a racing hook may have
+    // resumed it, or the user started something else there. Keeping the
+    // entry would retry a doomed `agent start` on every focus.
+    const occupant = () => {
+      try { return agentInPane(paneId); } catch { return null; }
     };
-    if (running()) {
-      log(`resume ${paneId}: ${kind} already running there; dropping sleeper entry`);
+    const there = occupant();
+    if (there) {
+      log(`resume ${paneId}: ${there.kind} already running there; dropping sleeper entry`);
       return true;
     }
 
@@ -373,7 +412,7 @@ function resumePane(paneId) {
       // agent_not_ready = launched but waiting on a startup dialog (trust
       // prompt, update notice). The user is looking at it; that's a resume.
       // Otherwise, if the agent is in the pane anyway, a racing hook won.
-      if (e.code === "agent_not_ready" || running()) {
+      if (e.code === "agent_not_ready" || occupant()) {
         log(`resume ${paneId}: ${kind} started (${e.code || "raced"})`);
         return true;
       }

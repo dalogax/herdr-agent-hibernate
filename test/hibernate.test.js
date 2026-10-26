@@ -195,6 +195,56 @@ test("resume drops the entry when the agent is already back in the pane", () => 
   assert.deepEqual(t.registry(), {});
 });
 
+test("resume drops the entry when a different agent kind now occupies the pane", () => {
+  const t = setup({ agents: [agent({ agent: "codex", agent_session: { value: "other" } })] });
+  t.writeRegistry({ "w1:p2": { kind: "claude", session_id: "sess-1", slept_at: 1 } });
+  assert.equal(t.run("resume", "w1:p2").status, 0);
+  assert.ok(!t.herdr().calls.some((c) => c[1] === "start"));
+  assert.deepEqual(t.registry(), {});
+});
+
+test("a corrupt registry is reported and never overwritten", () => {
+  const t = setup({ agents: [agent({ agent: "codex" })] });
+  const file = path.join(t.env.HERDR_PLUGIN_STATE_DIR, "registry.json");
+  fs.mkdirSync(t.env.HERDR_PLUGIN_STATE_DIR, { recursive: true });
+  for (const junk of ["{not json", "null", "[]"]) {
+    fs.writeFileSync(file, junk);
+    for (const cmd of [["resume", "w1:p2"], ["list"], ["resume-all"]]) {
+      const r = t.run(...cmd);
+      assert.equal(r.status, 1, cmd.join(" "));
+      assert.match(r.stderr, /not a valid registry/);
+    }
+    assert.equal(fs.readFileSync(file, "utf8"), junk);
+  }
+  // Sleeping still stops the agent; the failure to record it names the session.
+  const r = t.run("sleep-pane", "w1:p2");
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /exited \(session sess-1\) but could not be recorded/);
+  assert.equal(fs.readFileSync(file, "utf8"), "[]");
+});
+
+test("sleep records the sleeper when herdr goes away after the signal but the pid is gone", async () => {
+  const proc = fakeAgentProcess();
+  await new Promise((r) => setTimeout(r, 200));
+  // First `agent get` (the pre-sleep check) succeeds; every later one fails.
+  const t = setup({ agents: [agent({ pid: proc.pid })], failGetsFrom: 2 });
+  const r = t.run("sleep-pane", "w1:p2");
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(proc.alive(), false);
+  assert.equal(t.registry()["w1:p2"].session_id, "sess-1");
+});
+
+test("sleep refuses to record an exit it cannot verify", async () => {
+  const proc = fakeAgentProcess({ ignoreTerm: true });
+  await new Promise((r) => setTimeout(r, 200));
+  const t = setup({ agents: [agent({ pid: proc.pid })], failGetsFrom: 2 });
+  const r = t.run("sleep-pane", "w1:p2");
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /cannot verify the agent exited/);
+  assert.deepEqual(t.registry(), {});
+  proc.kill("SIGKILL");
+});
+
 test("concurrent focus hooks start the agent exactly once", async () => {
   const t = setup({ agents: [] });
   t.writeRegistry({ "w1:p2": { kind: "claude", session_id: "c1", slept_at: 1 } });

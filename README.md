@@ -140,7 +140,10 @@ environment (set before the server starts, then run `ensure-watcher`):
 `$HERDR_PLUGIN_STATE_DIR` (usually
 `~/.local/state/herdr/plugins/dalogax.agent-hibernate/`) holds
 `registry.json`, `watcher.pid` and `watch.log`. The log records state
-changes, sleeps and resumes, and rotates at 1 MB. Herdr's plugin state dir
+changes, sleeps and resumes, and rotates at 1 MB. A `registry.json` that
+does not parse is reported and left untouched rather than overwritten; if an
+agent was stopped but could not be recorded, the log line names its session
+id so you can resume it by hand. Herdr's plugin state dir
 is shared by all Herdr sessions, but pane ids are per session, so named
 sessions (`herdr --session work`) get their own `sessions/<name>/`
 subdirectory, each with its own registry and watcher.
