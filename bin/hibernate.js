@@ -66,6 +66,30 @@ const STATE_DIR = SESSION === "default"
 const REGISTRY = path.join(STATE_DIR, "registry.json");
 const REGISTRY_LOCK = path.join(STATE_DIR, "registry.lock");
 const LOOP_PID = path.join(STATE_DIR, "watcher.pid");
+// --- settings file ------------------------------------------------------------------
+// Herdr creates a config dir per plugin (HERDR_PLUGIN_CONFIG_DIR, usually
+// ~/.config/herdr/plugins/config/<id>) but injects nothing from it; like the
+// Ovis plugin, read our own `env` file there: KEY=VALUE lines, HIBERNATE_*
+// keys only. The file is the user's explicit setting, so it wins over an
+// inherited environment variable of the same name.
+const CONFIG_FILE = path.join(
+  process.env.HERDR_PLUGIN_CONFIG_DIR || path.join(process.env.HOME || ".", ".config", "herdr", "plugins", "config", PLUGIN_ID),
+  "env",
+);
+const configNotes = [];
+try {
+  fs.readFileSync(CONFIG_FILE, "utf8").split("\n").forEach((line, i) => {
+    const m = /^\s*(?:export\s+)?(HIBERNATE_[A-Z0-9_]+)\s*=\s*(.*?)\s*$/.exec(line);
+    if (m) {
+      process.env[m[1]] = m[2].replace(/^(["'])(.*)\1$/, "$2");
+      return;
+    }
+    if (line.trim() && !line.trim().startsWith("#")) configNotes.push(`${CONFIG_FILE}:${i + 1}: ignored (expected HIBERNATE_KEY=value)`);
+  });
+} catch (e) {
+  if (e.code !== "ENOENT") configNotes.push(`${CONFIG_FILE}: ${e.message}`);
+}
+
 const LOG = process.env.HIBERNATE_LOG || path.join(STATE_DIR, "watch.log");
 const LOG_MAX_BYTES = 1_000_000;
 
@@ -80,6 +104,7 @@ function numberEnv(name, fallback) {
   }
   return n;
 }
+configNotes.forEach(log);
 const IDLE_WINDOW_MS = numberEnv("HIBERNATE_IDLE_MINUTES", 30) * 60_000;
 const POLL_MS = numberEnv("HIBERNATE_POLL_SECONDS", 60) * 1000;
 const EXIT_TIMEOUT_MS = numberEnv("HIBERNATE_EXIT_TIMEOUT_SECONDS", 15) * 1000;
@@ -346,7 +371,10 @@ function sleepPane(paneId, { manual = false } = {}) {
  *  waiter finds that session's registry. */
 function startWaiter(paneId) {
   const q = (v) => `'${String(v).replace(/'/g, "'\\''")}'`;
-  const env = [`HERDR_PLUGIN_STATE_DIR=${q(process.env.HERDR_PLUGIN_STATE_DIR || FALLBACK_STATE_DIR)}`];
+  const env = [
+    `HERDR_PLUGIN_STATE_DIR=${q(process.env.HERDR_PLUGIN_STATE_DIR || FALLBACK_STATE_DIR)}`,
+    `HERDR_PLUGIN_CONFIG_DIR=${q(path.dirname(CONFIG_FILE))}`,
+  ];
   if (SESSION !== "default") env.push(`HERDR_SESSION=${q(SESSION)}`);
   for (const name of ["HERDR_BIN_PATH", "HIBERNATE_LOG"]) {
     if (process.env[name]) env.push(`${name}=${q(process.env[name])}`);
@@ -561,10 +589,13 @@ function pruneRegistry() {
 }
 
 // --- idle watcher (detached loop started by `startup`) ------------------------------
-/** Identifies the code a watcher runs, so an upgrade replaces old watchers. */
+/** Identifies the code and settings a watcher runs, so an upgrade or a
+ *  settings change replaces old watchers. */
 function codeStamp() {
   const st = fs.statSync(__filename);
-  return `${st.mtimeMs}:${st.size}`;
+  let settings = 0;
+  try { settings = fs.statSync(CONFIG_FILE).mtimeMs; } catch {}
+  return `${st.mtimeMs}:${st.size}:${settings}`;
 }
 
 function readWatcherPid() {
@@ -589,7 +620,7 @@ function ensureWatcher() {
   if (cur && ownProcess(cur.pid, "watch-loop")) {
     if (cur.stamp === codeStamp()) return `watcher already running (pid ${cur.pid})`;
     try { process.kill(cur.pid, "SIGTERM"); } catch {}
-    log(`replacing watcher pid=${cur.pid} (plugin code changed)`);
+    log(`replacing watcher pid=${cur.pid} (plugin code or settings changed)`);
   }
   fs.mkdirSync(STATE_DIR, { recursive: true });
   const child = spawn(process.execPath, [__filename, "watch-loop"], {
@@ -614,7 +645,7 @@ function watchLoop() {
     fs.writeFileSync(LOOP_PID, JSON.stringify({ pid: process.pid, stamp: codeStamp() }));
   }
 
-  log(`watcher start window=${IDLE_WINDOW_MS}ms poll=${POLL_MS}ms agents=${HIBERNATABLE.join(",")}`);
+  log(`watcher start window=${IDLE_WINDOW_MS}ms poll=${POLL_MS}ms agents=${HIBERNATABLE.join(",")} settings=${fs.existsSync(CONFIG_FILE) ? CONFIG_FILE : "none"}`);
   const idleSince = new Map(); // pane_id -> ms the current idle stretch began
   const lastSeq = new Map(); // pane_id -> state_change_seq seen last tick
   const lastState = new Map(); // pane_id -> "state(focused)" for change-only logging

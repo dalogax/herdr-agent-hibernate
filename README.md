@@ -141,8 +141,21 @@ Three things wake a sleeper, any of which is enough:
 
 ## Tuning
 
-Read from the environment the watcher inherits, i.e. the Herdr server's
-environment (set before the server starts, then run `ensure-watcher`):
+Settings live in the plugin's config directory, which Herdr creates when the
+plugin is installed or linked (`herdr plugin config-dir dalogax.agent-hibernate`,
+usually `~/.config/herdr/plugins/config/dalogax.agent-hibernate/`). Put
+`KEY=value` lines in a file named `env` there, then restart the watcher:
+
+```sh
+echo 'HIBERNATE_IDLE_MINUTES=120' >> "$(herdr plugin config-dir dalogax.agent-hibernate)/env"
+herdr plugin action invoke ensure-watcher --plugin dalogax.agent-hibernate
+```
+
+`ensure-watcher` replaces the watcher whenever the file has changed, so the
+new value takes effect at once. Only `HIBERNATE_*` keys are read; a value in
+the file wins over the same variable in the Herdr server's environment, which
+stays the fallback for anything the file does not set. Lines that are not
+`HIBERNATE_KEY=value` are noted in `watch.log` and skipped.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |

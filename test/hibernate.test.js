@@ -27,6 +27,7 @@ function setup(state, extraEnv = {}) {
     HERDR_BIN_PATH: FAKE,
     FAKE_HERDR_STATE: stateFile,
     HERDR_PLUGIN_STATE_DIR: path.join(dir, "state"),
+    HERDR_PLUGIN_CONFIG_DIR: path.join(dir, "config"),
     HIBERNATE_EXIT_TIMEOUT_SECONDS: "1",
     ...extraEnv,
   };
@@ -424,7 +425,7 @@ test("sleep leaves a key waiter in the pane unless HIBERNATE_WAKE_ON_KEY=0", () 
   assert.equal(t.run("sleep-pane", "w1:p2").status, 0);
   const run = t.herdr().calls.find((c) => c[0] === "pane" && c[1] === "run");
   assert.equal(run[2], "w1:p2");
-  assert.match(run[3], /^HERDR_PLUGIN_STATE_DIR='[^']+' HERDR_BIN_PATH='[^']+' '[^']+' '[^']+hibernate\.js' wait-key 'w1:p2'$/);
+  assert.match(run[3], /^HERDR_PLUGIN_STATE_DIR='[^']+' HERDR_PLUGIN_CONFIG_DIR='[^']+' HERDR_BIN_PATH='[^']+' '[^']+' '[^']+hibernate\.js' wait-key 'w1:p2'$/);
   assert.equal(t.registry()["w1:p2"].kind, "codex");
 
   const u = setup({ agents: [agent({ agent: "codex" })] }, { HIBERNATE_WAKE_ON_KEY: "0" });
@@ -483,4 +484,47 @@ test("resume stops a live waiter before starting the agent", async () => {
   assert.equal(await w.exited, 0);
   assert.equal(t.herdr().calls.filter((c) => c[1] === "start").length, 1);
   assert.deepEqual(t.registry(), {});
+});
+
+function writeConfig(t, text) {
+  fs.mkdirSync(t.env.HERDR_PLUGIN_CONFIG_DIR, { recursive: true });
+  const file = path.join(t.env.HERDR_PLUGIN_CONFIG_DIR, "env");
+  fs.writeFileSync(file, text);
+  return file;
+}
+const watcherPid = (t) => JSON.parse(fs.readFileSync(path.join(t.env.HERDR_PLUGIN_STATE_DIR, "watcher.pid"), "utf8")).pid;
+
+test("settings come from the config dir's env file and win over the environment", async () => {
+  const t = setup({ agents: [] }, { HIBERNATE_IDLE_MINUTES: "30" });
+  writeConfig(t, "# comment\nexport HIBERNATE_IDLE_MINUTES=120\nHIBERNATE_POLL_SECONDS = '5'\nHIBERNATE_AGENTS=\"claude\"\nPATH=/nope\nnot a setting\n");
+  t.run("startup");
+  const logFile = path.join(t.env.HERDR_PLUGIN_STATE_DIR, "watch.log");
+  try {
+    assert.ok(await waitFor(() => fs.existsSync(logFile) && /watcher start/.test(fs.readFileSync(logFile, "utf8"))));
+    const log = fs.readFileSync(logFile, "utf8");
+    assert.match(log, /window=7200000ms poll=5000ms agents=claude settings=.*\/config\/env/);
+    assert.match(log, /env:5: ignored/);
+    assert.match(log, /env:6: ignored/);
+  } finally {
+    stopWatcher(t);
+  }
+});
+
+test("ensure-watcher replaces the watcher when the settings file changes", async () => {
+  const t = setup({ agents: [] });
+  const file = writeConfig(t, "HIBERNATE_IDLE_MINUTES=60\n");
+  assert.match(t.run("startup").stdout, /spawned/);
+  const first = watcherPid(t);
+  try {
+    assert.match(t.run("startup").stdout, /already running/);
+    fs.writeFileSync(file, "HIBERNATE_IDLE_MINUTES=120\n");
+    const later = new Date(Date.now() + 5000);
+    fs.utimesSync(file, later, later); // a same-millisecond rewrite must still count as a change
+    assert.match(t.run("startup").stdout, /spawned/);
+    assert.notEqual(watcherPid(t), first);
+    assert.ok(await waitFor(() => /window=7200000ms/.test(fs.readFileSync(path.join(t.env.HERDR_PLUGIN_STATE_DIR, "watch.log"), "utf8"))));
+  } finally {
+    stopWatcher(t);
+    try { process.kill(first, "SIGTERM"); } catch {}
+  }
 });
