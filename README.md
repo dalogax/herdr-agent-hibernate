@@ -10,9 +10,10 @@ panes (OpenCode, Claude Code, Codex), resume the same session on focus.
 Watches agent panes; when one has been `idle` past a window and is not
 focused, it ends the agent process cleanly so the pane drops back to its
 shell (freeing the process and its RAM). Once the agent is verified gone, the
-native session id is recorded in the plugin state registry. When the pane is
-focused again, the plugin relaunches the agent in that same pane with its
-native resume flags, so the conversation picks up where it left off.
+native session id is recorded in the plugin state registry. The pane is left
+at a "press any key to resume" notice. When the pane is focused again, or a
+key is pressed in it, the plugin relaunches the agent in that same pane with
+its native resume flags, so the conversation picks up where it left off.
 
 This exists because Herdr has no "free the process, keep the pane"
 primitive — `pane release-agent` only clears an agent's registration, it
@@ -122,10 +123,39 @@ node bin/hibernate.js list
 node bin/hibernate.js resume w1:p2
 ```
 
+## Waking a slept pane
+
+Three things wake a sleeper, any of which is enough:
+
+- **Focus.** Herdr emits `pane.focused` when its own focus moves to the
+  pane (a click in the Herdr TUI, `herdr tab focus`, a script), and the
+  plugin's hook resumes it. Clients that keep their own selection without
+  moving Herdr's focus, such as web UIs, do not trigger this.
+- **A key in the pane.** After the agent exits, the plugin runs a small
+  waiter in the pane (`node bin/hibernate.js wait-key <pane>`) that clears
+  the screen, names the agent and session, and waits. Any key resumes the
+  session; Ctrl-C drops to the shell and keeps the sleeper for the other two
+  paths. This works from any client, including a phone, with no focus event.
+  `HIBERNATE_WAKE_ON_KEY=0` turns it off and leaves the bare shell instead.
+- **The `resume` action**, from a keybinding, the command palette, or the CLI.
+
 ## Tuning
 
-Read from the environment the watcher inherits, i.e. the Herdr server's
-environment (set before the server starts, then run `ensure-watcher`):
+Settings live in the plugin's config directory, which Herdr creates when the
+plugin is installed or linked (`herdr plugin config-dir dalogax.agent-hibernate`,
+usually `~/.config/herdr/plugins/config/dalogax.agent-hibernate/`). Put
+`KEY=value` lines in a file named `env` there, then restart the watcher:
+
+```sh
+echo 'HIBERNATE_IDLE_MINUTES=120' >> "$(herdr plugin config-dir dalogax.agent-hibernate)/env"
+herdr plugin action invoke ensure-watcher --plugin dalogax.agent-hibernate
+```
+
+`ensure-watcher` replaces the watcher whenever the file has changed, so the
+new value takes effect at once. Only `HIBERNATE_*` keys are read; a value in
+the file wins over the same variable in the Herdr server's environment, which
+stays the fallback for anything the file does not set. Lines that are not
+`HIBERNATE_KEY=value` are noted in `watch.log` and skipped.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
@@ -133,6 +163,7 @@ environment (set before the server starts, then run `ensure-watcher`):
 | `HIBERNATE_AGENTS` | `opencode,claude,codex` | Agent kinds the plugin may sleep |
 | `HIBERNATE_POLL_SECONDS` | `60` | Watcher poll interval |
 | `HIBERNATE_EXIT_TIMEOUT_SECONDS` | `15` | How long to wait for an agent to exit |
+| `HIBERNATE_WAKE_ON_KEY` | `1` | Leave a slept pane at a press-any-key notice (`0` to leave the bare shell) |
 | `HIBERNATE_DEBUG` | unset | Log raw focus-event payloads |
 
 ## State and logs
@@ -140,7 +171,10 @@ environment (set before the server starts, then run `ensure-watcher`):
 `$HERDR_PLUGIN_STATE_DIR` (usually
 `~/.local/state/herdr/plugins/dalogax.agent-hibernate/`) holds
 `registry.json`, `watcher.pid` and `watch.log`. The log records state
-changes, sleeps and resumes, and rotates at 1 MB. Herdr's plugin state dir
+changes, sleeps and resumes, and rotates at 1 MB. A `registry.json` that
+does not parse is reported and left untouched rather than overwritten; if an
+agent was stopped but could not be recorded, the log line names its session
+id so you can resume it by hand. Herdr's plugin state dir
 is shared by all Herdr sessions, but pane ids are per session, so named
 sessions (`herdr --session work`) get their own `sessions/<name>/`
 subdirectory, each with its own registry and watcher.
@@ -159,8 +193,12 @@ Herdr plugins run as your user without a sandbox, so here is the full list:
   `herdr agent list` every minute
 - `SIGTERM` sent to an idle OpenCode or Claude Code process in a pane; for
   Codex, `/quit` typed into its composer
+- `node bin/hibernate.js wait-key <pane>` typed into the slept pane's shell
+  (`herdr pane run`), which waits for a key and then runs the resume below
 - `herdr agent start … -- <resume flags>` in the same pane when you focus it
-- `ps` to confirm the process named in `watcher.pid` is really the watcher
+  or press a key in it
+- `ps` to confirm the process named in `watcher.pid` is really the watcher,
+  and that a recorded waiter pid is really the waiter
 
 It makes no network requests and reads nothing outside Herdr's CLI output
 and its own state directory.
@@ -182,6 +220,10 @@ running Herdr server. The demo GIF is reproducible; see
   not supervised; the watcher is spawned detached from `startup`. Only one
   runs per Herdr session; it exits on its own if the server is unreachable
   for 10 polls, and the next server start spawns a fresh one.
+- **Focus wake needs Herdr's own focus.** Web clients such as Ovis keep
+  their selection client-side and never move Herdr's focus, so the focus
+  hook does not fire from them. The key waiter and the `resume` action cover
+  that case.
 - **Resume takes the pane to a fresh TUI render.** The session (history,
   cwd, provider state) resumes, but on-screen scrollback is redrawn from the
   new TUI boot.

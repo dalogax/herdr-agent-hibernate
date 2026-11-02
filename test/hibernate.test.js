@@ -27,6 +27,7 @@ function setup(state, extraEnv = {}) {
     HERDR_BIN_PATH: FAKE,
     FAKE_HERDR_STATE: stateFile,
     HERDR_PLUGIN_STATE_DIR: path.join(dir, "state"),
+    HERDR_PLUGIN_CONFIG_DIR: path.join(dir, "config"),
     HIBERNATE_EXIT_TIMEOUT_SECONDS: "1",
     ...extraEnv,
   };
@@ -195,6 +196,56 @@ test("resume drops the entry when the agent is already back in the pane", () => 
   assert.deepEqual(t.registry(), {});
 });
 
+test("resume drops the entry when a different agent kind now occupies the pane", () => {
+  const t = setup({ agents: [agent({ agent: "codex", agent_session: { value: "other" } })] });
+  t.writeRegistry({ "w1:p2": { kind: "claude", session_id: "sess-1", slept_at: 1 } });
+  assert.equal(t.run("resume", "w1:p2").status, 0);
+  assert.ok(!t.herdr().calls.some((c) => c[1] === "start"));
+  assert.deepEqual(t.registry(), {});
+});
+
+test("a corrupt registry is reported and never overwritten", () => {
+  const t = setup({ agents: [agent({ agent: "codex" })] });
+  const file = path.join(t.env.HERDR_PLUGIN_STATE_DIR, "registry.json");
+  fs.mkdirSync(t.env.HERDR_PLUGIN_STATE_DIR, { recursive: true });
+  for (const junk of ["{not json", "null", "[]"]) {
+    fs.writeFileSync(file, junk);
+    for (const cmd of [["resume", "w1:p2"], ["list"], ["resume-all"]]) {
+      const r = t.run(...cmd);
+      assert.equal(r.status, 1, cmd.join(" "));
+      assert.match(r.stderr, /not a valid registry/);
+    }
+    assert.equal(fs.readFileSync(file, "utf8"), junk);
+  }
+  // Sleeping still stops the agent; the failure to record it names the session.
+  const r = t.run("sleep-pane", "w1:p2");
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /exited \(session sess-1\) but could not be recorded/);
+  assert.equal(fs.readFileSync(file, "utf8"), "[]");
+});
+
+test("sleep records the sleeper when herdr goes away after the signal but the pid is gone", async () => {
+  const proc = fakeAgentProcess();
+  await new Promise((r) => setTimeout(r, 200));
+  // First `agent get` (the pre-sleep check) succeeds; every later one fails.
+  const t = setup({ agents: [agent({ pid: proc.pid })], failGetsFrom: 2 });
+  const r = t.run("sleep-pane", "w1:p2");
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(proc.alive(), false);
+  assert.equal(t.registry()["w1:p2"].session_id, "sess-1");
+});
+
+test("sleep refuses to record an exit it cannot verify", async () => {
+  const proc = fakeAgentProcess({ ignoreTerm: true });
+  await new Promise((r) => setTimeout(r, 200));
+  const t = setup({ agents: [agent({ pid: proc.pid })], failGetsFrom: 2 });
+  const r = t.run("sleep-pane", "w1:p2");
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /cannot verify the agent exited/);
+  assert.deepEqual(t.registry(), {});
+  proc.kill("SIGKILL");
+});
+
 test("concurrent focus hooks start the agent exactly once", async () => {
   const t = setup({ agents: [] });
   t.writeRegistry({ "w1:p2": { kind: "claude", session_id: "c1", slept_at: 1 } });
@@ -356,5 +407,124 @@ test("watcher drops entries whose pane id now belongs to another terminal", asyn
     assert.deepEqual(Object.keys(t.registry()), ["w1:p3"]);
   } finally {
     stopWatcher(t);
+  }
+});
+
+/** A key waiter as the slept pane would run it, with a pipe for its stdin. */
+function spawnWaiter(t, pane = "w1:p2") {
+  const c = spawn(process.execPath, [BIN, "wait-key", pane], { env: t.env, stdio: ["pipe", "pipe", "pipe"] });
+  children.push(c);
+  let out = "";
+  c.stdout.on("data", (d) => (out += d));
+  const exited = new Promise((r) => c.on("exit", (code) => r(code)));
+  return { c, out: () => out, exited };
+}
+
+test("sleep leaves a key waiter in the pane unless HIBERNATE_WAKE_ON_KEY=0", () => {
+  const t = setup({ agents: [agent({ agent: "codex" })] });
+  assert.equal(t.run("sleep-pane", "w1:p2").status, 0);
+  const run = t.herdr().calls.find((c) => c[0] === "pane" && c[1] === "run");
+  assert.equal(run[2], "w1:p2");
+  assert.match(run[3], /^HERDR_PLUGIN_STATE_DIR='[^']+' HERDR_PLUGIN_CONFIG_DIR='[^']+' HERDR_BIN_PATH='[^']+' '[^']+' '[^']+hibernate\.js' wait-key 'w1:p2'$/);
+  assert.equal(t.registry()["w1:p2"].kind, "codex");
+
+  const u = setup({ agents: [agent({ agent: "codex" })] }, { HIBERNATE_WAKE_ON_KEY: "0" });
+  assert.equal(u.run("sleep-pane", "w1:p2").status, 0);
+  assert.ok(!u.herdr().calls.some((c) => c[0] === "pane" && c[1] === "run"));
+});
+
+test("a failed waiter launch keeps the sleeper recorded", () => {
+  const t = setup({ agents: [agent({ agent: "codex" })], failPaneRun: true });
+  const r = t.run("sleep-pane", "w1:p2");
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(t.registry()["w1:p2"].session_id, "sess-1");
+  assert.match(fs.readFileSync(path.join(t.env.HERDR_PLUGIN_STATE_DIR, "watch.log"), "utf8"), /waiter not started in w1:p2/);
+});
+
+test("a key pressed at the waiter resumes the session", async () => {
+  const t = setup({ agents: [], panes: [{ pane_id: "w1:p2", terminal_id: "term_a" }] });
+  t.writeRegistry({ "w1:p2": { kind: "claude", session_id: "k1", terminal_id: "term_a", slept_at: 1 } });
+  const w = spawnWaiter(t);
+  assert.ok(await waitFor(() => t.registry()["w1:p2"]?.waiter_pid === w.c.pid), "waiter did not register");
+  assert.ok(await waitFor(() => /Press any key/.test(w.out())));
+  w.c.stdin.write("x");
+  assert.equal(await w.exited, 0);
+  assert.ok(await waitFor(() => (t.herdr().calls || []).some((c) => c[1] === "start")), "agent was not started");
+  assert.ok(await waitFor(() => !t.registry()["w1:p2"]));
+  assert.deepEqual(t.herdr().calls.find((c) => c[1] === "start").slice(-2), ["--resume", "k1"]);
+});
+
+test("Ctrl-C at the waiter leaves the sleeper for the resume action", async () => {
+  const t = setup({ agents: [] });
+  t.writeRegistry({ "w1:p2": { kind: "claude", session_id: "k2", slept_at: 1 } });
+  const w = spawnWaiter(t);
+  assert.ok(await waitFor(() => t.registry()["w1:p2"]?.waiter_pid));
+  w.c.stdin.write("\x03");
+  assert.equal(await w.exited, 0);
+  await new Promise((r) => setTimeout(r, 300));
+  assert.ok(!(t.herdr().calls || []).some((c) => c[1] === "start"));
+  assert.equal(t.registry()["w1:p2"].session_id, "k2");
+  assert.equal(t.registry()["w1:p2"].waiter_pid, undefined);
+});
+
+test("the waiter exits at once when the pane is not hibernated", async () => {
+  const t = setup({ agents: [] });
+  const w = spawnWaiter(t);
+  assert.equal(await w.exited, 0);
+  assert.equal(w.out(), "");
+});
+
+test("resume stops a live waiter before starting the agent", async () => {
+  const t = setup({ agents: [] });
+  t.writeRegistry({ "w1:p2": { kind: "opencode", session_id: "k3", slept_at: 1 } });
+  const w = spawnWaiter(t);
+  assert.ok(await waitFor(() => t.registry()["w1:p2"]?.waiter_pid));
+  const r = t.run("resume", "w1:p2");
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(await w.exited, 0);
+  assert.equal(t.herdr().calls.filter((c) => c[1] === "start").length, 1);
+  assert.deepEqual(t.registry(), {});
+});
+
+function writeConfig(t, text) {
+  fs.mkdirSync(t.env.HERDR_PLUGIN_CONFIG_DIR, { recursive: true });
+  const file = path.join(t.env.HERDR_PLUGIN_CONFIG_DIR, "env");
+  fs.writeFileSync(file, text);
+  return file;
+}
+const watcherPid = (t) => JSON.parse(fs.readFileSync(path.join(t.env.HERDR_PLUGIN_STATE_DIR, "watcher.pid"), "utf8")).pid;
+
+test("settings come from the config dir's env file and win over the environment", async () => {
+  const t = setup({ agents: [] }, { HIBERNATE_IDLE_MINUTES: "30" });
+  writeConfig(t, "# comment\nexport HIBERNATE_IDLE_MINUTES=120\nHIBERNATE_POLL_SECONDS = '5'\nHIBERNATE_AGENTS=\"claude\"\nPATH=/nope\nnot a setting\n");
+  t.run("startup");
+  const logFile = path.join(t.env.HERDR_PLUGIN_STATE_DIR, "watch.log");
+  try {
+    assert.ok(await waitFor(() => fs.existsSync(logFile) && /watcher start/.test(fs.readFileSync(logFile, "utf8"))));
+    const log = fs.readFileSync(logFile, "utf8");
+    assert.match(log, /window=7200000ms poll=5000ms agents=claude settings=.*\/config\/env/);
+    assert.match(log, /env:5: ignored/);
+    assert.match(log, /env:6: ignored/);
+  } finally {
+    stopWatcher(t);
+  }
+});
+
+test("ensure-watcher replaces the watcher when the settings file changes", async () => {
+  const t = setup({ agents: [] });
+  const file = writeConfig(t, "HIBERNATE_IDLE_MINUTES=60\n");
+  assert.match(t.run("startup").stdout, /spawned/);
+  const first = watcherPid(t);
+  try {
+    assert.match(t.run("startup").stdout, /already running/);
+    fs.writeFileSync(file, "HIBERNATE_IDLE_MINUTES=120\n");
+    const later = new Date(Date.now() + 5000);
+    fs.utimesSync(file, later, later); // a same-millisecond rewrite must still count as a change
+    assert.match(t.run("startup").stdout, /spawned/);
+    assert.notEqual(watcherPid(t), first);
+    assert.ok(await waitFor(() => /window=7200000ms/.test(fs.readFileSync(path.join(t.env.HERDR_PLUGIN_STATE_DIR, "watch.log"), "utf8"))));
+  } finally {
+    stopWatcher(t);
+    try { process.kill(first, "SIGTERM"); } catch {}
   }
 });
