@@ -200,6 +200,7 @@ function normalizeAgent(a) {
     terminal_id: a.terminal_id || null,
     kind,
     name: a.name || null, // user-given agent name, if any
+    title: a.terminal_title_stripped || null, // the agent's session name
     state: a.agent_status,
     seq: a.state_change_seq ?? null,
     session: a.agent_session?.value || null,
@@ -278,6 +279,7 @@ function sleepPane(paneId, { manual = false } = {}) {
       kind: norm.kind,
       session_id: norm.session,
       agent_name: norm.name,
+      title: norm.title,
       terminal_id: norm.terminal_id,
       slept_at: Date.now(),
       idle_window_ms: IDLE_WINDOW_MS,
@@ -325,10 +327,13 @@ function runStub(paneId) {
     return reg[paneId];
   });
   if (!entry) return; // woken before the stub got going
-  const label = entry.agent_name || entryKind(entry);
-  process.stdout.write(`\x1b[2J\x1b[H💤 ${label} is hibernated (session ${entry.session_id}).\nFocus this pane to resume it.\n`);
+  const kind = entryKind(entry);
+  // Keep the agent's session name: Herdr reads it from the terminal title.
+  const title = (entry.title || "").replace(/[\x00-\x1f\x7f]/g, "");
+  if (title) process.stdout.write(`\x1b]0;${title}\x07`);
+  process.stdout.write(`\x1b[2J\x1b[H💤 ${title || kind} is hibernated (session ${entry.session_id}).\nFocus this pane to resume it.\n`);
   process.on("SIGTERM", () => process.exit(0));
-  showAsleep(paneId, label);
+  showAsleep(paneId, kind);
   setInterval(() => {}, 1 << 30);
 }
 
