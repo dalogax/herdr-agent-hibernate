@@ -166,6 +166,37 @@ test("the stub lists the sleeper until resume stops it", async (tc) => {
   assert.deepEqual(t.herdr().agents.map((a) => [a.agent, a.display_agent]), [["claude", undefined]]);
 });
 
+test("a sleeper survives a Herdr restart", async (tc) => {
+  const t = setup({ agents: [], panes: [{ pane_id: "w1:p2", terminal_id: "term_a" }] });
+  t.writeRegistry({ "w1:p2": { kind: "claude", title: "prod push", session_id: "sess-9", terminal_id: "term_a", slept_at: 1 } });
+  const stub = t.runAsync(["stub", "w1:p2"]);
+  tc.after(() => stub.child.kill("SIGKILL"));
+  let resume;
+  assert.ok(await waitFor(() => (resume = t.herdr().agents[0]?.resume)?.length));
+  stub.child.kill("SIGKILL");
+  await stub;
+
+  // Restart: the server comes back with the same pane id on a new terminal,
+  // the watcher drops the stale entry, and Herdr types the resume command
+  // into the restored pane's shell.
+  const s = t.herdr();
+  s.agents = [];
+  s.panes = [{ pane_id: "w1:p2", terminal_id: "term_b" }];
+  fs.writeFileSync(t.env.FAKE_HERDR_STATE, JSON.stringify(s));
+  t.writeRegistry({});
+  assert.equal(resume[0], "env");
+  const restored = spawn(resume[1], resume.slice(2), { env: { ...t.env, HERDR_PANE_ID: "w1:p2" } });
+  tc.after(() => restored.kill("SIGKILL"));
+  assert.ok(await waitFor(() => t.registry()["w1:p2"]?.stub_pid === restored.pid
+    && t.herdr().agents.some((a) => a.display_agent === "💤 claude")));
+  assert.equal(t.registry()["w1:p2"].terminal_id, "term_b");
+
+  const r = t.run("resume", "w1:p2");
+  assert.equal(r.status, 0, r.stderr);
+  const start = t.herdr().calls.find((c) => c[1] === "start");
+  assert.deepEqual(start.slice(-2), ["--resume", "sess-9"]);
+});
+
 test("a stub whose sleeper already woke exits without listing it", async () => {
   const t = setup({ agents: [] });
   assert.equal((await t.runAsync(["stub", "w1:p2"])).code, 0);

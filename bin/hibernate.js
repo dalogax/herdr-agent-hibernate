@@ -333,8 +333,23 @@ function runStub(paneId) {
   if (title) process.stdout.write(`\x1b]0;${title}\x07`);
   process.stdout.write(`\x1b[2J\x1b[H💤 ${title || kind} is hibernated (session ${entry.session_id}).\nFocus this pane to resume it.\n`);
   process.on("SIGTERM", () => process.exit(0));
-  showAsleep(paneId, kind);
+  showAsleep(paneId, entry);
   setInterval(() => {}, 1 << 30);
+}
+
+/** After a server restart Herdr types the stub's resume command (see
+ *  showAsleep) into each restored pane: the pane id survives, the terminal
+ *  is new, and the watcher has dropped the old entry. Put it back. */
+function restoreStub(payload) {
+  const paneId = process.env.HERDR_PANE_ID; // fresh: set by the new server
+  const saved = JSON.parse(Buffer.from(payload || "", "base64url").toString("utf8") || "{}");
+  if (!paneId || !AGENT_PROFILES[saved.kind] || typeof saved.session_id !== "string") {
+    throw new Error("stub --restore: no pane or bad payload");
+  }
+  const pane = herdrJson(["pane", "get", paneId]).result.pane;
+  updateRegistry((reg) => { reg[paneId] = { ...saved, terminal_id: pane.terminal_id }; });
+  log(`restored ${paneId}[${saved.kind}] session=${saved.session_id} after server restart`);
+  runStub(paneId);
 }
 
 function stopStub(entry) {
@@ -345,10 +360,17 @@ function stopStub(entry) {
   while (Date.now() < end && isOurProcess(pid, " stub ")) sleepMs(50);
 }
 
-function showAsleep(paneId, label) {
+function showAsleep(paneId, entry) {
+  const kind = entryKind(entry);
+  const { session_id, agent_name, title, slept_at } = entry;
+  const payload = Buffer.from(JSON.stringify({ kind, session_id, agent_name, title, slept_at })).toString("base64url");
+  // Herdr keeps a reported agent's resume command in session.json and types
+  // it into the restored pane after a restart. It must start with a plain
+  // command name, hence env.
+  const resume = ["env", process.execPath, __filename, "stub", "--restore", payload];
   try {
-    herdr(["pane", "report-agent", paneId, "--source", PLUGIN_ID, "--agent", SLEEP_AGENT, "--state", "unknown"]);
-    herdr(["pane", "report-metadata", paneId, "--source", PLUGIN_ID, "--agent", SLEEP_AGENT, "--display-agent", `💤 ${label}`]);
+    herdr(["pane", "report-agent", paneId, "--source", PLUGIN_ID, "--agent", SLEEP_AGENT, "--state", "unknown", "--", ...resume]);
+    herdr(["pane", "report-metadata", paneId, "--source", PLUGIN_ID, "--agent", SLEEP_AGENT, "--display-agent", `💤 ${kind}`]);
   } catch (e) {
     log(`sidebar ${paneId}: ${e.message}`);
   }
@@ -645,7 +667,8 @@ function main(cmd, args) {
       break;
 
     case "stub":
-      runStub(args[0]);
+      if (args[0] === "--restore") restoreStub(args[1]);
+      else runStub(args[0]);
       break;
 
     case "watch-loop":
