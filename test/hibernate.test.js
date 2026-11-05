@@ -281,6 +281,24 @@ test("watcher sleeps an idle unfocused agent after the window, never a focused o
   }
 });
 
+test("watcher leaves a finished-but-unviewed (done) agent awake; manual sleep may take it", async () => {
+  const proc = fakeAgentProcess();
+  const t = setup(
+    { agents: [agent({ pid: proc.pid, agent_status: "done" })], panes: [{ pane_id: "w1:p2", terminal_id: "term_a" }] },
+    { HIBERNATE_IDLE_MINUTES: "0.005", HIBERNATE_POLL_SECONDS: "0.1" },
+  );
+  t.run("startup");
+  try {
+    await new Promise((r) => setTimeout(r, 1000));
+    assert.equal(t.registry()["w1:p2"], undefined);
+    assert.ok(proc.alive());
+  } finally {
+    stopWatcher(t);
+  }
+  assert.equal(t.run("sleep-pane", "w1:p2").status, 0);
+  assert.ok(t.registry()["w1:p2"]);
+});
+
 test("watcher prunes closed panes and follows moved ones", async () => {
   const t = setup(
     { agents: [], panes: [{ pane_id: "w2:p1", terminal_id: "term_moved" }] },
