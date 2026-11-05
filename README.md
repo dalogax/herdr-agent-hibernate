@@ -53,6 +53,10 @@ it will be submitted when the pane is slept. Exclude Codex with
 - sleeps only agents whose state is exactly `idle` or `done`, **never**
   `working`, `blocked`, or `unknown`, and the watcher never sleeps a focused
   pane
+- never sleeps an agent that still has shell commands running (background
+  tasks, a dev server it started), since stopping the agent would kill them.
+  Any shell under the agent's process counts, so an MCP server launched
+  through `sh -c` keeps its agent awake too
 - rechecks the state immediately before stopping the agent
 - the idle clock resets whenever the pane's agent changes state (any output,
   a new turn, a permission prompt), including changes that happen and settle

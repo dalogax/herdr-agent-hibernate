@@ -51,8 +51,10 @@ function setup(state, extraEnv = {}) {
 /** A process standing in for the agent binary. Double-forked so it is not
  *  our child: like a real agent (reaped by the pane's shell) it vanishes on
  *  exit instead of lingering as a zombie while spawnSync blocks our loop. */
-function fakeAgentProcess({ ignoreTerm = false } = {}) {
-  const code = ignoreTerm ? "process.on('SIGTERM',()=>{});setInterval(()=>{},1e3)" : "setInterval(()=>{},1e3)";
+function fakeAgentProcess({ ignoreTerm = false, withShell = false } = {}) {
+  let code = ignoreTerm ? "process.on('SIGTERM',()=>{});setInterval(()=>{},1e3)" : "setInterval(()=>{},1e3)";
+  // `; :` keeps sh from exec'ing into sleep, so a shell stays in the tree.
+  if (withShell) code = "require('child_process').spawn('sh',['-c','sleep 10; :'],{stdio:'ignore'});" + code;
   const r = spawnSync("sh", ["-c", `"${process.execPath}" -e "${code}" >/dev/null 2>&1 & echo $!`], { encoding: "utf8" });
   const pid = Number(r.stdout.trim());
   children.push({ kill: () => process.kill(pid, "SIGKILL") });
@@ -101,7 +103,8 @@ test("sleep refuses when the agent ignores the exit and records nothing", async 
 });
 
 test("codex exits via typed /quit", () => {
-  const t = setup({ agents: [agent({ agent: "codex" })] });
+  const proc = fakeAgentProcess();
+  const t = setup({ agents: [agent({ agent: "codex", pid: proc.pid })] });
   const r = t.run("sleep-pane", "w1:p2");
   assert.equal(r.status, 0, r.stderr);
   assert.ok(t.herdr().calls.some((c) => c[1] === "prompt" && c[3] === "/quit"));
@@ -124,13 +127,24 @@ test("sleep refuses non-idle agents and agents without a session", () => {
   }
 });
 
+test("sleep refuses while the agent has shell commands running", async () => {
+  const proc = fakeAgentProcess({ withShell: true });
+  assert.ok(await waitFor(() => spawnSync("pgrep", ["-P", String(proc.pid)]).status === 0), "fake agent's shell never started");
+  const t = setup({ agents: [agent({ pid: proc.pid })] });
+  const r = t.run("sleep-pane", "w1:p2");
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /shell commands running/);
+  assert.ok(proc.alive());
+  assert.deepEqual(t.registry(), {});
+});
+
 test("manual sleep may target the focused pane", () => {
-  const t = setup({ agents: [agent({ agent: "codex", focused: true })] });
+  const t = setup({ agents: [agent({ pid: fakeAgentProcess().pid, agent: "codex", focused: true })] });
   assert.equal(t.run("sleep-pane", "w1:p2").status, 0);
 });
 
 test("HIBERNATE_AGENTS excludes kinds", () => {
-  const t = setup({ agents: [agent({ agent: "codex" })] }, { HIBERNATE_AGENTS: "claude,opencode" });
+  const t = setup({ agents: [agent({ pid: fakeAgentProcess().pid, agent: "codex" })] }, { HIBERNATE_AGENTS: "claude,opencode" });
   const r = t.run("sleep-pane", "w1:p2");
   assert.equal(r.status, 1);
   assert.match(r.stderr, /not hibernatable/);
@@ -161,7 +175,7 @@ test("resume keeps the agent's own name, falling back when it is taken", () => {
 });
 
 test("sleep records the agent's own name only when it has one", () => {
-  const t = setup({ agents: [agent({ agent: "codex", name: "fixer" }), agent({ pane_id: "w1:p3", agent: "codex" })] });
+  const t = setup({ agents: [agent({ pid: fakeAgentProcess().pid, agent: "codex", name: "fixer" }), agent({ pane_id: "w1:p3", pid: fakeAgentProcess().pid, agent: "codex" })] });
   t.run("sleep-pane", "w1:p2");
   t.run("sleep-pane", "w1:p3");
   assert.equal(t.registry()["w1:p2"].agent_name, "fixer");
@@ -220,7 +234,7 @@ test("resume action takes the pane from plugin context", () => {
 });
 
 test("named Herdr sessions get their own registry", () => {
-  const t = setup({ agents: [agent({ agent: "codex" })] }, { HERDR_SESSION: "work" });
+  const t = setup({ agents: [agent({ pid: fakeAgentProcess().pid, agent: "codex" })] }, { HERDR_SESSION: "work" });
   assert.equal(t.run("sleep-pane", "w1:p2").status, 0);
   assert.deepEqual(t.registry(), {}); // default session's registry untouched
   const reg = JSON.parse(fs.readFileSync(path.join(t.env.HERDR_PLUGIN_STATE_DIR, "sessions", "work", "registry.json"), "utf8"));
