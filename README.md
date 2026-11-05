@@ -50,8 +50,9 @@ it will be submitted when the pane is slept. Exclude Codex with
 
 ## Safety model
 
-- sleeps only agents whose state is exactly `idle` or `done`, **never**
-  `working`, `blocked`, or `unknown`, and the watcher never sleeps a focused
+- the watcher sleeps only agents whose state is exactly `idle`, **never**
+  `working`, `blocked`, `unknown`, or `done` (finished but not yet viewed),
+  and never a focused pane; a manual sleep may also take a `done` or focused
   pane
 - rechecks the state immediately before stopping the agent
 - the idle clock resets whenever the pane's agent changes state (any output,

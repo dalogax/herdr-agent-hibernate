@@ -208,15 +208,16 @@ function normalizeAgent(a) {
 }
 
 // --- sleep ----------------------------------------------------------------------
-/** Refuse unless, right now, the agent is idle/done (never working, blocked
- *  or unknown) and — for the watcher — not the pane you are looking at. */
-function assertSleepable(paneId, { allowFocused = false } = {}) {
+/** Refuse unless, right now, the agent is idle (never working, blocked or
+ *  unknown). The watcher also spares the pane you are looking at and `done`
+ *  panes (finished but not yet viewed); an explicit sleep may take either. */
+function assertSleepable(paneId, { manual = false } = {}) {
   const norm = agentInPane(paneId);
   if (!norm) throw new Error(`${paneId} hosts no agent`);
-  if (norm.state !== "idle" && norm.state !== "done") {
-    throw new Error(`${paneId} is ${norm.state} — refusing to sleep a non-idle agent`);
+  if (norm.state !== "idle" && !(manual && norm.state === "done")) {
+    throw new Error(`${paneId} is ${norm.state} — refusing to sleep it`);
   }
-  if (norm.focused && !allowFocused) {
+  if (norm.focused && !manual) {
     throw new Error(`${paneId} is the focused pane — refusing to sleep an on-screen agent`);
   }
   if (!HIBERNATABLE.includes(norm.kind)) {
@@ -253,7 +254,7 @@ function waitForExit(paneId, session) {
 }
 
 function sleepPane(paneId, { manual = false } = {}) {
-  const norm = assertSleepable(paneId, { allowFocused: manual });
+  const norm = assertSleepable(paneId, { manual });
   const profile = AGENT_PROFILES[norm.kind];
 
   let how;
@@ -520,9 +521,9 @@ function watchLoop() {
       const seqChanged = p.seq !== null && lastSeq.has(p.pane_id) && lastSeq.get(p.pane_id) !== p.seq;
       lastSeq.set(p.pane_id, p.seq);
 
-      // `done` = idle-but-unviewed: still safe to sleep, and its clock must
-      // accrue too or background-finished panes never reach the threshold.
-      const sleepable = (p.state === "idle" || p.state === "done") && !p.focused;
+      // `done` = finished but not yet viewed: keep it awake until you have
+      // looked at it; viewing turns it `idle`, which starts the clock.
+      const sleepable = p.state === "idle" && !p.focused;
       if (!sleepable) { idleSince.delete(p.pane_id); continue; }
       if (seqChanged || !idleSince.has(p.pane_id)) idleSince.set(p.pane_id, now);
       if (now - idleSince.get(p.pane_id) < IDLE_WINDOW_MS) continue;
