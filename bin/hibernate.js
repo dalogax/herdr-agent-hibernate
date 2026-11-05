@@ -200,6 +200,7 @@ function normalizeAgent(a) {
     terminal_id: a.terminal_id || null,
     kind,
     name: a.name || null, // user-given agent name, if any
+    title: a.terminal_title_stripped || null, // the agent's session name
     state: a.agent_status,
     seq: a.state_change_seq ?? null,
     session: a.agent_session?.value || null,
@@ -278,13 +279,111 @@ function sleepPane(paneId, { manual = false } = {}) {
       kind: norm.kind,
       session_id: norm.session,
       agent_name: norm.name,
+      title: norm.title,
       terminal_id: norm.terminal_id,
       slept_at: Date.now(),
       idle_window_ms: IDLE_WINDOW_MS,
     };
   });
+  startStub(paneId);
   log(`slept ${paneId}[${norm.kind}] session=${norm.session} via ${how}${manual ? " (manual)" : ""}`);
   return norm;
+}
+
+// --- sidebar --------------------------------------------------------------------
+// Herdr drops a pane from its agent sidebar once the agent process is gone,
+// and drops any agent reported on a pane that is back at a bare shell (within
+// ~1s, verified on 0.9.5). So a sleeper gets a stub process in its pane that
+// reports a placeholder agent ("💤 <name>", dim dot) and waits; resume stops
+// the stub before `agent start`. The watcher never picks up the placeholder.
+const SLEEP_AGENT = "hibernated";
+
+function startStub(paneId) {
+  const q = (s) => `'${s.replace(/'/g, "'\\''")}'`;
+  try {
+    // Typed text goes to whatever owns the terminal: a live agent would take
+    // it as a prompt. Only a bare shell (foreground group = shell) may get it;
+    // give a just-exited agent a moment to hand the terminal back.
+    const bareShell = () => {
+      const i = herdrJson(["pane", "process-info", "--pane", paneId]).result.process_info;
+      return i.foreground_process_group_id === i.shell_pid;
+    };
+    const end = Date.now() + 2000;
+    while (!bareShell()) {
+      if (Date.now() > end) throw new Error("pane is not at a bare shell; not starting the stub");
+      sleepMs(100);
+    }
+    // Leading space keeps it out of shell history (HIST_IGNORE_SPACE).
+    herdr(["pane", "run", paneId, ` ${q(process.execPath)} ${q(__filename)} stub ${paneId}`]);
+  } catch (e) {
+    log(`stub ${paneId}: ${e.message}`);
+  }
+}
+
+/** The stub itself: runs in the pane until resume stops it. */
+function runStub(paneId) {
+  const entry = updateRegistry((reg) => {
+    if (reg[paneId]) reg[paneId].stub_pid = process.pid;
+    return reg[paneId];
+  });
+  if (!entry) return; // woken before the stub got going
+  const kind = entryKind(entry);
+  // Keep the agent's session name: Herdr reads it from the terminal title.
+  const title = (entry.title || "").replace(/[\x00-\x1f\x7f]/g, "");
+  if (title) process.stdout.write(`\x1b]0;${title}\x07`);
+  process.stdout.write(`\x1b[2J\x1b[H💤 ${title || kind} is hibernated (session ${entry.session_id}).\nFocus this pane to resume it.\n`);
+  process.on("SIGTERM", () => process.exit(0));
+  showAsleep(paneId, entry);
+  setInterval(() => {}, 1 << 30);
+}
+
+/** After a server restart Herdr types the stub's resume command (see
+ *  showAsleep) into each restored pane: the pane id survives, the terminal
+ *  is new, and the watcher has dropped the old entry. Put it back. */
+function restoreStub(payload) {
+  const paneId = process.env.HERDR_PANE_ID; // fresh: set by the new server
+  const saved = JSON.parse(Buffer.from(payload || "", "base64url").toString("utf8") || "{}");
+  if (!paneId || !AGENT_PROFILES[saved.kind] || typeof saved.session_id !== "string") {
+    throw new Error("stub --restore: no pane or bad payload");
+  }
+  const pane = herdrJson(["pane", "get", paneId]).result.pane;
+  updateRegistry((reg) => { reg[paneId] = { ...saved, terminal_id: pane.terminal_id }; });
+  log(`restored ${paneId}[${saved.kind}] session=${saved.session_id} after server restart`);
+  runStub(paneId);
+}
+
+function stopStub(entry) {
+  const pid = entry.stub_pid;
+  if (!isOurProcess(pid, " stub ")) return;
+  try { process.kill(pid, "SIGTERM"); } catch {}
+  const end = Date.now() + 3000;
+  while (Date.now() < end && isOurProcess(pid, " stub ")) sleepMs(50);
+}
+
+function showAsleep(paneId, entry) {
+  const kind = entryKind(entry);
+  const { session_id, agent_name, title, slept_at } = entry;
+  const payload = Buffer.from(JSON.stringify({ kind, session_id, agent_name, title, slept_at })).toString("base64url");
+  // Herdr keeps a reported agent's resume command in session.json and types
+  // it into the restored pane after a restart. It must start with a plain
+  // command name, hence env.
+  const resume = ["env", process.execPath, __filename, "stub", "--restore", payload];
+  try {
+    herdr(["pane", "report-agent", paneId, "--source", PLUGIN_ID, "--agent", SLEEP_AGENT, "--state", "unknown", "--", ...resume]);
+    herdr(["pane", "report-metadata", paneId, "--source", PLUGIN_ID, "--agent", SLEEP_AGENT, "--display-agent", `💤 ${kind}`]);
+  } catch (e) {
+    log(`sidebar ${paneId}: ${e.message}`);
+  }
+}
+
+/** Must run before `agent start`, which needs a pane with no agent in it. */
+function clearAsleep(paneId) {
+  for (const args of [
+    ["release-agent", paneId, "--source", PLUGIN_ID, "--agent", SLEEP_AGENT],
+    ["report-metadata", paneId, "--source", PLUGIN_ID, "--clear-display-agent"],
+  ]) {
+    try { herdr(["pane", ...args]); } catch {}
+  }
 }
 
 // --- resume ---------------------------------------------------------------------
@@ -346,6 +445,8 @@ function resumePane(paneId) {
     });
     if (!entry) return false;
     const kind = entryKind(entry);
+    stopStub(entry);
+    clearAsleep(paneId);
 
     const running = () => {
       try { return agentInPane(paneId)?.kind === kind; } catch { return false; }
@@ -380,6 +481,7 @@ function resumePane(paneId) {
       updateRegistry((reg) => {
         reg[paneId] = { ...entry, kind, last_resume_error: String(e.message || e).slice(0, 300) };
       });
+      startStub(paneId);
       log(`resume-failed ${paneId}: ${e.message}`);
       throw e;
     }
@@ -441,13 +543,14 @@ function readWatcherPid() {
   }
 }
 
-/** Alive AND actually our watcher (guards against pid reuse). */
-function isWatcherProcess(pid) {
+/** Alive AND actually our watcher/stub (guards against pid reuse). */
+function isOurProcess(pid, marker) {
   if (!pid) return false;
   try { process.kill(pid, 0); } catch { return false; }
   const r = spawnSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8" });
-  return r.status === 0 && r.stdout.includes("watch-loop");
+  return r.status === 0 && r.stdout.includes("hibernate.js") && r.stdout.includes(marker);
 }
+const isWatcherProcess = (pid) => isOurProcess(pid, "watch-loop");
 
 function ensureWatcher() {
   const cur = readWatcherPid();
@@ -561,6 +664,11 @@ function main(cmd, args) {
   switch (cmd) {
     case "startup":
       console.log(ensureWatcher());
+      break;
+
+    case "stub":
+      if (args[0] === "--restore") restoreStub(args[1]);
+      else runStub(args[0]);
       break;
 
     case "watch-loop":

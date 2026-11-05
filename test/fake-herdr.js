@@ -78,6 +78,30 @@ const res = withState((s) => {
     return ok({ process_info: { pane_id: pane, shell_pid: 1, foreground_process_group_id: a?.pid || 1, foreground_processes: procs } });
   }
   if (group === "pane" && cmd === "list") return ok({ panes: s.panes || [] });
+  if (group === "pane" && cmd === "run") return ok({ type: "pane_run" }); // recorded in calls only
+  const opt = (k) => rest[rest.indexOf(k) + 1];
+  if (group === "pane" && cmd === "get") {
+    const p = (s.panes || []).find((x) => x.pane_id === rest[0]);
+    return p ? ok({ pane: p }) : fail("pane_not_found");
+  }
+  if (group === "pane" && cmd === "report-agent") {
+    // Like the real CLI: the resume command (after --) must start with a plain name.
+    const resume = rest.includes("--") ? rest.slice(rest.indexOf("--") + 1) : [];
+    if (resume[0]?.includes("/")) return fail("invalid_resume_argv");
+    s.agents = s.agents.filter((a) => a.pane_id !== rest[0]);
+    s.agents.push({ pane_id: rest[0], agent: opt("--agent"), agent_status: opt("--state"), source: opt("--source"), resume });
+    return ok({ type: "pane_agent_reported" });
+  }
+  if (group === "pane" && cmd === "release-agent") {
+    s.agents = s.agents.filter((a) => !(a.pane_id === rest[0] && a.source === opt("--source")));
+    return ok({ type: "pane_agent_released" });
+  }
+  if (group === "pane" && cmd === "report-metadata") {
+    const a = find(rest[0]);
+    if (a && rest.includes("--clear-display-agent")) delete a.display_agent;
+    else if (a) a.display_agent = opt("--display-agent");
+    return ok({ type: "pane_metadata_reported" });
+  }
   return fail("unsupported_fake_call");
 });
 

@@ -48,6 +48,24 @@ the typed `/quit`. **Caveat:** if you leave unsent text in a Codex composer,
 it will be submitted when the pane is slept. Exclude Codex with
 `HIBERNATE_AGENTS=opencode,claude` if that matters to you.
 
+### While asleep
+
+A sleeping pane stays in Herdr's agent sidebar as `💤 <kind>`, under the
+session's name. Herdr drops an agent from the sidebar once the pane is
+back at a bare shell, so after the agent exits the plugin runs a small
+stub process in the pane (`hibernate.js stub <pane>`) that keeps a
+placeholder `hibernated` agent reported and restores the terminal title.
+Waking the pane stops the stub.
+
+The stub also gives Herdr a restore command, so sleepers survive a Herdr
+restart or reboot. With `[session] resume_agents_on_restore` on (the
+default), Herdr types that command into the restored pane; the stub
+re-registers the sleeper under the pane's new terminal and it wakes on
+focus as usual. Two side effects: the restore command shows up in the
+pane and in your shell history, and the pane that is already focused
+when Herdr opens gets no focus event, so focus another pane and come
+back to wake it.
+
 ## Safety model
 
 - sleeps only agents whose state is exactly `idle` or `done`, **never**
@@ -59,6 +77,8 @@ it will be submitted when the pane is slept. Exclude Codex with
   between two polls
 - a sleeper is recorded only after the agent has actually left the pane; if
   it does not exit within 15 s, nothing is recorded and the pane is left alone
+- the stub command is typed into a pane only while its foreground process
+  is the shell itself, so it can never land in a running agent's composer
 - Claude and Codex states come from Herdr's screen detection, which can
   occasionally misread. The pre-sleep recheck means a misread degrades to a
   no-op.

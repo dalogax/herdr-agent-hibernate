@@ -31,12 +31,13 @@ function setup(state, extraEnv = {}) {
     ...extraEnv,
   };
   const run = (...args) => spawnSync(process.execPath, [BIN, ...args], { env, encoding: "utf8" });
-  const runAsync = (args, moreEnv = {}) => new Promise((resolve) => {
+  const runAsync = (args, moreEnv = {}) => {
     const c = spawn(process.execPath, [BIN, ...args], { env: { ...env, ...moreEnv } });
+    children.push(c);
     let out = "";
     c.stdout.on("data", (d) => (out += d));
-    c.on("exit", (code) => resolve({ code, out }));
-  });
+    return Object.assign(new Promise((resolve) => c.on("exit", (code) => resolve({ code, out }))), { child: c });
+  };
   const herdr = () => JSON.parse(fs.readFileSync(stateFile, "utf8"));
   const registry = () => {
     try { return JSON.parse(fs.readFileSync(path.join(env.HERDR_PLUGIN_STATE_DIR, "registry.json"), "utf8")); } catch { return {}; }
@@ -136,6 +137,87 @@ test("HIBERNATE_AGENTS excludes kinds", () => {
   assert.match(r.stderr, /not hibernatable/);
 });
 
+// Herdr drops an agent reported on a bare shell, so the sidebar placeholder
+// needs a process in the pane: the stub.
+const stubRun = (t) => t.herdr().calls.filter((c) => c[0] === "pane" && c[1] === "run");
+
+test("sleep starts a stub in the pane", () => {
+  const t = setup({ agents: [agent({ pid: fakeAgentProcess().pid, agent: "codex" })] });
+  assert.equal(t.run("sleep-pane", "w1:p2").status, 0);
+  const [run] = stubRun(t);
+  assert.equal(run[2], "w1:p2");
+  assert.match(run[3], /hibernate\.js' stub w1:p2$/);
+});
+
+test("the stub lists the sleeper until resume stops it", async (tc) => {
+  const t = setup({ agents: [] });
+  t.writeRegistry({ "w1:p2": { kind: "claude", agent_name: "claude-w1p2-abc", title: "prod push\x07", session_id: "s", slept_at: 1 } });
+  const stub = t.runAsync(["stub", "w1:p2"]);
+  tc.after(() => stub.child.kill("SIGKILL"));
+  assert.ok(await waitFor(() => t.registry()["w1:p2"]?.stub_pid
+    && t.herdr().agents.some((a) => a.agent === "hibernated" && a.agent_status === "unknown" && a.display_agent === "💤 claude")));
+  // The placeholder must be gone first, or `agent start` finds the pane taken.
+  const r = t.run("resume", "w1:p2");
+  assert.equal(r.status, 0, r.stderr);
+  const { code, out } = await stub;
+  assert.equal(code, 0);
+  // The agent's terminal title (its session name) is kept, control chars stripped.
+  assert.ok(out.includes("\x1b]0;prod push\x07"), JSON.stringify(out));
+  assert.deepEqual(t.herdr().agents.map((a) => [a.agent, a.display_agent]), [["claude", undefined]]);
+});
+
+test("a sleeper survives a Herdr restart", async (tc) => {
+  const t = setup({ agents: [], panes: [{ pane_id: "w1:p2", terminal_id: "term_a" }] });
+  t.writeRegistry({ "w1:p2": { kind: "claude", title: "prod push", session_id: "sess-9", terminal_id: "term_a", slept_at: 1 } });
+  const stub = t.runAsync(["stub", "w1:p2"]);
+  tc.after(() => stub.child.kill("SIGKILL"));
+  let resume;
+  assert.ok(await waitFor(() => (resume = t.herdr().agents[0]?.resume)?.length));
+  stub.child.kill("SIGKILL");
+  await stub;
+
+  // Restart: the server comes back with the same pane id on a new terminal,
+  // the watcher drops the stale entry, and Herdr types the resume command
+  // into the restored pane's shell.
+  const s = t.herdr();
+  s.agents = [];
+  s.panes = [{ pane_id: "w1:p2", terminal_id: "term_b" }];
+  fs.writeFileSync(t.env.FAKE_HERDR_STATE, JSON.stringify(s));
+  t.writeRegistry({});
+  assert.equal(resume[0], "env");
+  const restored = spawn(resume[1], resume.slice(2), { env: { ...t.env, HERDR_PANE_ID: "w1:p2" } });
+  tc.after(() => restored.kill("SIGKILL"));
+  assert.ok(await waitFor(() => t.registry()["w1:p2"]?.stub_pid === restored.pid
+    && t.herdr().agents.some((a) => a.display_agent === "💤 claude")));
+  assert.equal(t.registry()["w1:p2"].terminal_id, "term_b");
+
+  const r = t.run("resume", "w1:p2");
+  assert.equal(r.status, 0, r.stderr);
+  const start = t.herdr().calls.find((c) => c[1] === "start");
+  assert.deepEqual(start.slice(-2), ["--resume", "sess-9"]);
+});
+
+test("a stub whose sleeper already woke exits without listing it", async () => {
+  const t = setup({ agents: [] });
+  assert.equal((await t.runAsync(["stub", "w1:p2"])).code, 0);
+  assert.deepEqual(t.herdr().agents, []);
+});
+
+test("the stub is never typed into a pane running a program", () => {
+  // Something else (here an unknown agent) owns the pane, so start fails.
+  const t = setup({ agents: [agent({ agent: "gemini", pid: process.pid })] });
+  t.writeRegistry({ "w1:p2": { kind: "claude", session_id: "s", slept_at: 1 } });
+  assert.equal(t.run("resume", "w1:p2").status, 1);
+  assert.equal(stubRun(t).length, 0);
+});
+
+test("a failed resume restarts the stub", () => {
+  const t = setup({ agents: [], start: "fail" });
+  t.writeRegistry({ "w1:p2": { kind: "claude", session_id: "s", slept_at: 1 } });
+  assert.equal(t.run("resume", "w1:p2").status, 1);
+  assert.equal(stubRun(t).length, 1);
+});
+
 test("resume starts the agent with native resume argv and clears the entry", () => {
   const t = setup({ agents: [] });
   t.writeRegistry({ "w1:p2": { kind: "opencode", session_id: "ses_x", slept_at: 1 } });
@@ -158,6 +240,14 @@ test("resume keeps the agent's own name, falling back when it is taken", () => {
   const names = u.herdr().calls.filter((c) => c[1] === "start").map((c) => c[2]);
   assert.equal(names[0], "reviewer");
   assert.match(names[1], /^claude-w1p2-/);
+});
+
+test("sleep records the agent's terminal title", async () => {
+  const proc = fakeAgentProcess();
+  await new Promise((r) => setTimeout(r, 200));
+  const t = setup({ agents: [agent({ pid: proc.pid, terminal_title_stripped: "prod push" })] });
+  assert.equal(t.run("sleep-pane", "w1:p2").status, 0);
+  assert.equal(t.registry()["w1:p2"].title, "prod push");
 });
 
 test("sleep records the agent's own name only when it has one", () => {
