@@ -225,7 +225,37 @@ function assertSleepable(paneId, { allowFocused = false } = {}) {
   if (!norm.session) {
     throw new Error(`${paneId} has no native session reference yet — send it a message first, and make sure the integration is installed (herdr integration install ${norm.kind})`);
   }
+  // An idle agent can still own running commands (background tasks, a dev
+  // server); stopping the agent would kill them.
+  const shells = shellsUnder(agentPid(paneId, norm.kind));
+  if (shells.length) {
+    throw new Error(`${paneId} has shell commands running (pid ${shells.join(", ")}) — stopping the agent would kill them`);
+  }
   return norm;
+}
+
+const SHELLS = new Set(["sh", "bash", "zsh", "fish", "dash", "ksh"]);
+/** Pids of shells anywhere under `root`: agents run their commands through
+ *  one (Claude's Bash tool is `zsh -c ...`), while MCP servers are plain
+ *  node/python/uv children.
+ *  ponytail: an MCP server launched via `sh -c` would also keep the agent
+ *  awake; match the agent's own command wrapper if that shows up. */
+function shellsUnder(root) {
+  const r = spawnSync("ps", ["-A", "-o", "pid=,ppid=,command="], { encoding: "utf8" });
+  if (r.status !== 0) throw new Error(`ps failed: ${r.stderr.trim()}`);
+  const procs = r.stdout.trim().split("\n").map((l) => l.trim().split(/\s+/));
+  const tree = new Set([root]);
+  const shells = [];
+  for (let grew = true; grew;) {
+    grew = false;
+    for (const [pid, ppid, argv0] of procs) {
+      if (tree.has(+pid) || !tree.has(+ppid)) continue;
+      tree.add(+pid);
+      grew = true;
+      if (SHELLS.has(path.basename(argv0).replace(/^-/, ""))) shells.push(+pid);
+    }
+  }
+  return shells;
 }
 
 /** The agent's own process in the pane's foreground (not the shell, not
