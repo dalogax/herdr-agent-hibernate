@@ -142,7 +142,7 @@ test("HIBERNATE_AGENTS excludes kinds", () => {
 const stubRun = (t) => t.herdr().calls.filter((c) => c[0] === "pane" && c[1] === "run");
 
 test("sleep starts a stub in the pane", () => {
-  const t = setup({ agents: [agent({ agent: "codex" })] });
+  const t = setup({ agents: [agent({ pid: fakeAgentProcess().pid, agent: "codex" })] });
   assert.equal(t.run("sleep-pane", "w1:p2").status, 0);
   const [run] = stubRun(t);
   assert.equal(run[2], "w1:p2");
