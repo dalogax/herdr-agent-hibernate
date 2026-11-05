@@ -136,6 +136,52 @@ test("HIBERNATE_AGENTS excludes kinds", () => {
   assert.match(r.stderr, /not hibernatable/);
 });
 
+// Herdr drops an agent reported on a bare shell, so the sidebar placeholder
+// needs a process in the pane: the stub.
+const stubRun = (t) => t.herdr().calls.filter((c) => c[0] === "pane" && c[1] === "run");
+
+test("sleep starts a stub in the pane", () => {
+  const t = setup({ agents: [agent({ agent: "codex" })] });
+  assert.equal(t.run("sleep-pane", "w1:p2").status, 0);
+  const [run] = stubRun(t);
+  assert.equal(run[2], "w1:p2");
+  assert.match(run[3], /hibernate\.js' stub w1:p2$/);
+});
+
+test("the stub lists the sleeper until resume stops it", async () => {
+  const t = setup({ agents: [] });
+  t.writeRegistry({ "w1:p2": { kind: "claude", agent_name: "log-21", session_id: "s", slept_at: 1 } });
+  const stub = t.runAsync(["stub", "w1:p2"]);
+  assert.ok(await waitFor(() => t.registry()["w1:p2"]?.stub_pid
+    && t.herdr().agents.some((a) => a.agent === "hibernated" && a.agent_status === "unknown" && a.display_agent === "💤 log-21")));
+  // The placeholder must be gone first, or `agent start` finds the pane taken.
+  const r = t.run("resume", "w1:p2");
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal((await stub).code, 0);
+  assert.deepEqual(t.herdr().agents.map((a) => [a.agent, a.display_agent]), [["claude", undefined]]);
+});
+
+test("a stub whose sleeper already woke exits without listing it", async () => {
+  const t = setup({ agents: [] });
+  assert.equal((await t.runAsync(["stub", "w1:p2"])).code, 0);
+  assert.deepEqual(t.herdr().agents, []);
+});
+
+test("the stub is never typed into a pane running a program", () => {
+  // Something else (here an unknown agent) owns the pane, so start fails.
+  const t = setup({ agents: [agent({ agent: "gemini", pid: process.pid })] });
+  t.writeRegistry({ "w1:p2": { kind: "claude", session_id: "s", slept_at: 1 } });
+  assert.equal(t.run("resume", "w1:p2").status, 1);
+  assert.equal(stubRun(t).length, 0);
+});
+
+test("a failed resume restarts the stub", () => {
+  const t = setup({ agents: [], start: "fail" });
+  t.writeRegistry({ "w1:p2": { kind: "claude", session_id: "s", slept_at: 1 } });
+  assert.equal(t.run("resume", "w1:p2").status, 1);
+  assert.equal(stubRun(t).length, 1);
+});
+
 test("resume starts the agent with native resume argv and clears the entry", () => {
   const t = setup({ agents: [] });
   t.writeRegistry({ "w1:p2": { kind: "opencode", session_id: "ses_x", slept_at: 1 } });
