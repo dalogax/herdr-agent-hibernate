@@ -96,6 +96,56 @@ const AGENT_PROFILES = {
 const HIBERNATABLE = (process.env.HIBERNATE_AGENTS || Object.keys(AGENT_PROFILES).join(","))
   .split(",").map((s) => s.trim().toLowerCase()).filter((k) => AGENT_PROFILES[k]);
 
+/** Split a flag string the way a shell would for plain words: whitespace
+ *  separates, single/double quotes group, backslash escapes. No expansion. */
+function splitArgs(str) {
+  const out = [];
+  let cur = "";
+  let has = false;
+  let quote = null;
+  for (let i = 0; i < str.length; i++) {
+    const c = str[i];
+    if (quote) {
+      if (c === quote) quote = null;
+      else if (c === "\\" && quote === '"' && i + 1 < str.length) cur += str[++i];
+      else cur += c;
+    } else if (c === "'" || c === '"') {
+      quote = c;
+      has = true;
+    } else if (c === "\\" && i + 1 < str.length) {
+      cur += str[++i];
+      has = true;
+    } else if (/\s/.test(c)) {
+      if (has) out.push(cur);
+      cur = "";
+      has = false;
+    } else {
+      cur += c;
+      has = true;
+    }
+  }
+  if (quote) throw new Error(`unterminated ${quote} quote`);
+  if (has) out.push(cur);
+  return out;
+}
+
+/** Extra flags for a resumed agent, from HIBERNATE_<KIND>_ARGS, placed
+ *  before the resume flags: e.g. HIBERNATE_CLAUDE_ARGS="--dangerously-skip-permissions"
+ *  for someone who normally launches Claude through an alias. `agent start`
+ *  always runs the kind's canonical executable, so only flags are
+ *  configurable, not the binary. */
+function extraResumeArgs(kind) {
+  const name = `HIBERNATE_${kind.toUpperCase()}_ARGS`;
+  const raw = process.env[name];
+  if (!raw) return [];
+  try {
+    return splitArgs(raw);
+  } catch (e) {
+    log(`ignoring invalid ${name}=${JSON.stringify(raw)}: ${e.message}`);
+    return [];
+  }
+}
+
 // --- utils ----------------------------------------------------------------------
 function sleepMs(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
@@ -355,7 +405,7 @@ function resumePane(paneId) {
       return true;
     }
 
-    const argv = AGENT_PROFILES[kind].argvResume(entry.session_id);
+    const argv = [...extraResumeArgs(kind), ...AGENT_PROFILES[kind].argvResume(entry.session_id)];
     const start = (name) => herdr(["agent", "start", name, "--kind", kind, "--pane", paneId, "--", ...argv]);
     // `agent start` requires an available shell pane — which is exactly what
     // a cleanly-exited sleeper is. It also requires a name unique among live
@@ -383,7 +433,7 @@ function resumePane(paneId) {
       log(`resume-failed ${paneId}: ${e.message}`);
       throw e;
     }
-    log(`resumed ${paneId}[${kind}] session=${entry.session_id}`);
+    log(`resumed ${paneId}[${kind}] session=${entry.session_id} argv=${JSON.stringify(argv)}`);
     return true;
   } finally {
     release();
@@ -637,4 +687,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { AGENT_PROFILES, entryKind, normalizeAgent };
+module.exports = { AGENT_PROFILES, entryKind, normalizeAgent, splitArgs };
