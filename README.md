@@ -134,6 +134,24 @@ environment (set before the server starts, then run `ensure-watcher`):
 | `HIBERNATE_POLL_SECONDS` | `60` | Watcher poll interval |
 | `HIBERNATE_EXIT_TIMEOUT_SECONDS` | `15` | How long to wait for an agent to exit |
 | `HIBERNATE_DEBUG` | unset | Log raw focus-event payloads |
+| `HIBERNATE_CLAUDE_ARGS`, `HIBERNATE_OPENCODE_ARGS`, `HIBERNATE_CODEX_ARGS` | unset | Extra flags passed to that agent on resume, before the resume flags |
+
+### Custom launch flags
+
+If you normally start an agent through an alias or wrapper, e.g.
+`alias claudedsp='claude --dangerously-skip-permissions'`, a resumed pane
+would otherwise come back as plain `claude --resume <id>`. Give the plugin
+the same flags:
+
+```sh
+export HIBERNATE_CLAUDE_ARGS="--dangerously-skip-permissions"
+```
+
+The resume then runs `claude --dangerously-skip-permissions --resume <id>`.
+The value is split like shell words (whitespace separates, quotes group,
+backslash escapes) but nothing is expanded. Only flags are configurable:
+`herdr agent start` always launches the agent kind's canonical executable,
+so shell aliases and wrapper scripts themselves cannot be used.
 
 ## State and logs
 

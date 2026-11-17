@@ -65,6 +65,8 @@ const agent = (over) => ({
   terminal_id: "term_a", agent_session: { value: "sess-1" }, ...over,
 });
 
+const afterDashes = (call) => call.slice(call.indexOf("--") + 1);
+
 const waitFor = async (pred, ms = 5000) => {
   const end = Date.now() + ms;
   while (Date.now() < end) {
@@ -144,6 +146,38 @@ test("resume starts the agent with native resume argv and clears the entry", () 
   const start = t.herdr().calls.find((c) => c[1] === "start");
   assert.deepEqual(start.slice(3), ["--kind", "opencode", "--pane", "w1:p2", "--", "-s", "ses_x"]);
   assert.deepEqual(t.registry(), {});
+});
+
+test("HIBERNATE_<KIND>_ARGS adds flags before the resume argv, for that kind only", () => {
+  const t = setup({ agents: [] }, {
+    HIBERNATE_CLAUDE_ARGS: "--dangerously-skip-permissions  --model 'claude opus'",
+  });
+  t.writeRegistry({
+    "w1:p2": { kind: "claude", session_id: "sess-1", slept_at: 1 },
+    "w1:p3": { kind: "opencode", session_id: "ses_x", slept_at: 1 },
+  });
+  assert.equal(t.run("resume", "w1:p2").status, 0);
+  assert.equal(t.run("resume", "w1:p3").status, 0);
+  const starts = t.herdr().calls.filter((c) => c[1] === "start");
+  assert.deepEqual(afterDashes(starts[0]), ["--dangerously-skip-permissions", "--model", "claude opus", "--resume", "sess-1"]);
+  assert.deepEqual(afterDashes(starts[1]), ["-s", "ses_x"]);
+});
+
+test("an unparseable HIBERNATE_<KIND>_ARGS is ignored, not fatal", () => {
+  const t = setup({ agents: [] }, { HIBERNATE_CLAUDE_ARGS: "--oops 'unterminated" });
+  t.writeRegistry({ "w1:p2": { kind: "claude", session_id: "sess-1", slept_at: 1 } });
+  assert.equal(t.run("resume", "w1:p2").status, 0);
+  const start = t.herdr().calls.find((c) => c[1] === "start");
+  assert.deepEqual(afterDashes(start), ["--resume", "sess-1"]);
+});
+
+test("splitArgs handles quotes and escapes", () => {
+  const { splitArgs } = require(BIN);
+  assert.deepEqual(splitArgs(""), []);
+  assert.deepEqual(splitArgs("  a  b "), ["a", "b"]);
+  assert.deepEqual(splitArgs(`--x "a b" 'c d' e\\ f ""`), ["--x", "a b", "c d", "e f", ""]);
+  assert.deepEqual(splitArgs(`"say \\"hi\\""`), ['say "hi"']);
+  assert.throws(() => splitArgs(`"open`), /unterminated/);
 });
 
 test("resume keeps the agent's own name, falling back when it is taken", () => {
